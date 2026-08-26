@@ -21,7 +21,7 @@ func (s *Session) handleGroupSystemEvent(evt *events.GroupInfo) {
 	s.dispatchWebhook("group_participants", s.groupSystemPayload(evt))
 
 	cfg := s.getChatwoot()
-	if !cfg.valid() || !cfg.Groups {
+	if !cfg.valid() || !cfg.Groups || cfg.DisableMessageRelay {
 		return
 	}
 	lines := s.groupSystemLines(evt)

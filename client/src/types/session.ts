@@ -13,4 +13,5 @@ export type SessionInfo = {
   state: SessionState;
   paired: boolean;
   recording: boolean;
+  qr?: string;
 };

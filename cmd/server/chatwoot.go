@@ -73,10 +73,15 @@ type ChatwootConfig struct {
 	// ImportHistory: ao (re)conectar a conta, importa para o Chatwoot o histórico de
 	// conversas 1:1 que o WhatsApp envia (HistorySync). As mensagens entram como NOTA
 	// PRIVADA, com a data original, reconstruindo a timeline sem reenviar nada ao
-	// contato. Só há HistorySync ao PAREAR o dispositivo — ligue antes de conectar.
+	// contato. Só há HISTORYSYNC ao PAREAR o dispositivo — ligue antes de conectar.
 	// ImportHistoryDays limita a janela (0 = importHistoryDefaultDays).
 	ImportHistory     bool `json:"import_history"`
 	ImportHistoryDays int  `json:"import_history_days"`
+	// DisableMessageRelay: quando true, o AstraCalls NÃO encaminha mensagens (texto,
+	// mídia, votos, RSVPs, eventos de grupo, histórico) para o Chatwoot. Útil quando
+	// outro serviço (ex.: evolution-go) já cuida das mensagens na mesma inbox.
+	// Chamadas, gravações e alertas de sistema continuam sendo enviados.
+	DisableMessageRelay bool `json:"disable_message_relay"`
 }
 
 // Limites da importação de histórico (evitam afogar a inbox do Chatwoot).
@@ -213,6 +218,9 @@ func (s *Session) shouldMirrorOwn(msgID string, cfg ChatwootConfig) bool {
 func (s *Session) chatwootPushIncoming(evt *events.Message) {
 	cfg := s.getChatwoot()
 	if !cfg.valid() {
+		return
+	}
+	if cfg.DisableMessageRelay {
 		return
 	}
 	if evt.Info.IsFromMe {

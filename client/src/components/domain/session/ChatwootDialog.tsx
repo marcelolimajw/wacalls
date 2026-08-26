@@ -27,6 +27,7 @@ export const ChatwootDialog = ({ sid }: { sid: string }) => {
   const [mirrorApi, setMirrorApi] = useState(false);
   const [importHistory, setImportHistory] = useState(false);
   const [importDays, setImportDays] = useState("30");
+  const [disableMsgRelay, setDisableMsgRelay] = useState(false);
 
   const webhookUrl = `${window.location.origin}/api/sessions/${sid}/chatwoot/webhook`;
 
@@ -39,6 +40,7 @@ export const ChatwootDialog = ({ sid }: { sid: string }) => {
         setMirrorApi(!!c.mirror_api);
         setImportHistory(!!c.import_history);
         setImportDays(c.import_history_days ? String(c.import_history_days) : "30");
+        setDisableMsgRelay(!!c.disable_message_relay);
         setForm({
           url: c.url || "",
           account_id: c.account_id ? String(c.account_id) : "",
@@ -65,6 +67,7 @@ export const ChatwootDialog = ({ sid }: { sid: string }) => {
         mirror_api: mirrorApi,
         import_history: importHistory,
         import_history_days: Number(importDays) || 30,
+        disable_message_relay: disableMsgRelay,
       });
       toast.success("Chatwoot conectado a esta sessão");
       setEnabled(true);
@@ -195,6 +198,21 @@ export const ChatwootDialog = ({ sid }: { sid: string }) => {
               </div>
             )}
           </div>
+
+          <label className="flex cursor-pointer items-start justify-between gap-4 rounded-lg border p-3">
+            <span className="space-y-0.5">
+              <span className="block text-sm font-medium">Desabilitar encaminhamento de mensagens</span>
+              <span className="block text-xs text-muted-foreground">
+                Quando ativo, esta sessão NÃO envia mensagens para o Chatwoot (outro serviço, como
+                evolution-go, cuida disso). Chamadas e gravações continuam funcionando.
+              </span>
+            </span>
+            <Switch
+              checked={disableMsgRelay}
+              onCheckedChange={setDisableMsgRelay}
+              aria-label="Desabilitar encaminhamento de mensagens"
+            />
+          </label>
         </div>
 
         <DialogFooter className="gap-2 sm:justify-between">

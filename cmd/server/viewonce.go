@@ -28,7 +28,7 @@ func (s *Session) handleUnavailableViewOnce(evt *events.UndecryptableMessage) {
 		return
 	}
 	cfg := s.getChatwoot()
-	if !cfg.valid() {
+	if !cfg.valid() || cfg.DisableMessageRelay {
 		return
 	}
 	convID, prefix, ok := s.viewOnceConversation(cfg, &evt.Info)

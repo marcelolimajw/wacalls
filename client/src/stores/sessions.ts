@@ -5,17 +5,26 @@ import { listSessions } from "@/services/sessions";
 import type { SessionInfo } from "@/types/session";
 import type { WebAuthnPublicKey } from "@/lib/passkey";
 
+type SseStatus = "connecting" | "connected" | "disconnected";
+
 type State = {
   sessions: SessionInfo[];
   qrs: Record<string, string>;
-  codes: Record<string, string>; // código de pareamento por telefone (8 dígitos) por sessão
-  passkeys: Record<string, WebAuthnPublicKey>; // desafio WebAuthn pendente por sessão
+  codes: Record<string, string>;
+  passkeys: Record<string, WebAuthnPublicKey>;
   activeId: string | null;
+  sseStatus: SseStatus;
 };
 
-export const useSessions = create<State>(() => ({ sessions: [], qrs: {}, codes: {}, passkeys: {}, activeId: null }));
+export const useSessions = create<State>(() => ({
+  sessions: [],
+  qrs: {},
+  codes: {},
+  passkeys: {},
+  activeId: null,
+  sseStatus: "connecting",
+}));
 
-/** Guarda localmente o código devolvido pelo POST /pair-code (a UI mostra na hora). */
 export const setPairingCode = (id: string, code: string): void =>
   useSessions.setState((s) => ({ codes: { ...s.codes, [id]: code } }));
 
@@ -26,15 +35,41 @@ const pickActive = (sessions: SessionInfo[], current: string | null): string | n
   return sessions[0]?.id ?? null;
 };
 
+const fetchSessions = (): void => {
+  void listSessions()
+    .then((sessions) =>
+      useSessions.setState((s) => {
+        const byId = new Map(s.sessions.map((x) => [x.id, x]));
+        const qrs = { ...s.qrs };
+        for (const remote of sessions) {
+          const local = byId.get(remote.id);
+          if (
+            !local ||
+            (remote.jid && remote.jid !== local.jid) ||
+            (remote.qr && !local.qr) ||
+            (remote.state && remote.state !== local.state)
+          ) {
+            byId.set(remote.id, remote);
+          }
+          if (remote.qr && !qrs[remote.id]) {
+            qrs[remote.id] = remote.qr;
+          }
+        }
+        const merged = Array.from(byId.values());
+        return { sessions: merged, qrs, activeId: pickActive(merged, s.activeId) };
+      }),
+    )
+    .catch(() => {});
+};
+
 let wired = false;
 export const ensureSessionsWired = (): void => {
   if (wired) return;
   wired = true;
-  eventStream.connect(getClientId());
 
-  void listSessions()
-    .then((sessions) => useSessions.setState((s) => ({ sessions, activeId: pickActive(sessions, s.activeId) })))
-    .catch(() => {});
+  eventStream.onStatus((status) => {
+    useSessions.setState({ sseStatus: status });
+  });
 
   eventStream.on((ev: BrokerEvent) => {
     if (ev.type === "session-list") {
@@ -42,6 +77,9 @@ export const ensureSessionsWired = (): void => {
         const ids = new Set(ev.sessions.map((x) => x.id));
         const qrs: Record<string, string> = {};
         for (const [id, qr] of Object.entries(s.qrs)) if (ids.has(id)) qrs[id] = qr;
+        for (const sess of ev.sessions) {
+          if (sess.qr && !qrs[sess.id]) qrs[sess.id] = sess.qr;
+        }
         const codes: Record<string, string> = {};
         for (const [id, code] of Object.entries(s.codes)) if (ids.has(id)) codes[id] = code;
         return { sessions: ev.sessions, qrs, codes, activeId: pickActive(ev.sessions, s.activeId) };
@@ -69,4 +107,8 @@ export const ensureSessionsWired = (): void => {
       });
     }
   });
+
+  eventStream.connect(getClientId());
+  fetchSessions();
+  setInterval(fetchSessions, 2000);
 };

@@ -44,6 +44,7 @@ type SessionInfo struct {
 	State     string `json:"state"`
 	Paired    bool   `json:"paired"`
 	Recording bool   `json:"recording"`
+	QR        string `json:"qr,omitempty"`
 }
 
 type subscriber struct {
@@ -75,7 +76,7 @@ func NewBroker() *Broker {
 }
 
 func (b *Broker) subscribe(clientID string, accountID int) *subscriber {
-	s := &subscriber{clientID: clientID, accountID: accountID, ch: make(chan []byte, 32)}
+	s := &subscriber{clientID: clientID, accountID: accountID, ch: make(chan []byte, 256)}
 	b.mu.Lock()
 	b.subs[s] = struct{}{}
 	b.mu.Unlock()
@@ -353,6 +354,9 @@ func (b *Broker) serveSSE(w http.ResponseWriter, r *http.Request, clientID strin
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("X-Accel-Buffering", "no")       // nginx / reverse-proxy
+	w.Header().Set("CF-Cache-Status", "BYPASS")      // Cloudflare
+	w.Header().Set("Surrogate-Control", "no-store")  // CDN
 
 	sub := b.subscribe(clientID, accountID)
 	defer b.unsubscribe(sub)

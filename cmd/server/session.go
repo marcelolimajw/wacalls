@@ -577,7 +577,7 @@ func (s *Session) info() SessionInfo {
 	if id := s.client.Store.ID; id != nil {
 		jid = id.String()
 	}
-	return SessionInfo{ID: s.id, Name: s.name, JID: jid, State: a.State, Paired: a.Paired || jid != "", Recording: rec}
+	return SessionInfo{ID: s.id, Name: s.name, JID: jid, State: a.State, Paired: a.Paired || jid != "", Recording: rec, QR: a.QR}
 }
 
 func (s *Session) setBridge(callID string, b *Bridge, oc media.Codec) {

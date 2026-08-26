@@ -38,22 +38,72 @@ export type BrokerEvent =
     };
 
 type Listener = (ev: BrokerEvent) => void;
+type StatusListener = (status: "connecting" | "connected" | "disconnected") => void;
 
 class EventStream {
   #es: EventSource | null = null;
   #listeners = new Set<Listener>();
+  #statusListeners = new Set<StatusListener>();
+  #clientId: string = "";
+  #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  #reconnectDelay = 1000;
+  #maxReconnectDelay = 30000;
+  #closed = false;
+  #reconnectable = true;
+  onReconnect: (() => void) | null = null;
 
   connect(clientId: string): void {
     if (this.#es) return;
-    const url = `${getApiBase()}/api/events?clientId=${encodeURIComponent(clientId)}&apiKey=${encodeURIComponent(getApiKey())}`;
+    this.#clientId = clientId;
+    this.#closed = false;
+    this.#doConnect();
+  }
+
+  #doConnect(): void {
+    if (this.#closed) return;
+    this.#notifyStatus("connecting");
+    const url = `${getApiBase()}/api/events?clientId=${encodeURIComponent(this.#clientId)}&apiKey=${encodeURIComponent(getApiKey())}`;
     this.#es = new EventSource(url);
+    this.#es.onopen = () => {
+      this.#reconnectDelay = 1000;
+      this.#notifyStatus("connected");
+    };
     this.#es.onmessage = (ev) => {
       try {
         const parsed: BrokerEvent = JSON.parse(ev.data);
         for (const l of this.#listeners) l(parsed);
-      } catch {}
+      } catch (err) {
+        console.error("[EventStream] parse error:", err, ev.data);
+      }
     };
-    this.#es.onerror = () => {};
+    this.#es.onerror = () => {
+      this.#notifyStatus("disconnected");
+      this.#es?.close();
+      this.#es = null;
+      if (!this.#closed && this.#reconnectable) {
+        this.#scheduleReconnect();
+      }
+    };
+  }
+
+  #scheduleReconnect(): void {
+    if (this.#reconnectTimer) return;
+    const delay = this.#reconnectDelay;
+    this.#reconnectTimer = setTimeout(() => {
+      this.#reconnectTimer = null;
+      this.#doConnect();
+      this.onReconnect?.();
+    }, delay);
+    this.#reconnectDelay = Math.min(this.#reconnectDelay * 2, this.#maxReconnectDelay);
+  }
+
+  #notifyStatus(status: "connecting" | "connected" | "disconnected"): void {
+    for (const l of this.#statusListeners) l(status);
+  }
+
+  onStatus(l: StatusListener): () => void {
+    this.#statusListeners.add(l);
+    return () => this.#statusListeners.delete(l);
   }
 
   on(l: Listener): () => void {
@@ -62,6 +112,12 @@ class EventStream {
   }
 
   close(): void {
+    this.#closed = true;
+    this.#reconnectable = false;
+    if (this.#reconnectTimer) {
+      clearTimeout(this.#reconnectTimer);
+      this.#reconnectTimer = null;
+    }
     this.#es?.close();
     this.#es = null;
   }

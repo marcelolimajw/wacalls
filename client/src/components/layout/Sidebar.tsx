@@ -28,7 +28,18 @@ export const Sidebar = ({ onNavigate }: { onNavigate?: () => void }) => {
     setCreating(true);
     try {
       const { id } = await createSession("WhatsApp");
-      setActiveSession(id);
+      const placeholder: SessionInfo = {
+        id,
+        name: "WhatsApp",
+        jid: "",
+        state: "connecting",
+        paired: false,
+        recording: false,
+      };
+      useSessions.setState((s) => {
+        if (s.sessions.some((x) => x.id === id)) return { activeId: id };
+        return { sessions: [...s.sessions, placeholder], activeId: id };
+      });
       onNavigate?.();
     } catch (e) {
       toast.error((e as Error).message);

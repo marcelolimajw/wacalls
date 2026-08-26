@@ -12,6 +12,8 @@ export type ChatwootConfig = {
   import_history?: boolean;
   /** Janela do histórico a importar, em dias (0 = padrão). */
   import_history_days?: number;
+  /** Quando true, não encaminha mensagens para o Chatwoot (outro serviço cuida disso). */
+  disable_message_relay?: boolean;
 };
 
 export const getChatwoot = (sid: string) =>

@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AstraCalls - Pareamento</title>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1/build/qrcode.min.js"></script>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:system-ui,-apple-system,sans-serif;background:#0a0a0a;color:#e4e4e7;min-height:100vh;display:flex;align-items:center;justify-content:center}
+  .card{background:#18181b;border:1px solid #27272a;border-radius:12px;padding:32px;width:100%;max-width:420px;margin:16px}
+  h1{font-size:20px;text-align:center;margin-bottom:24px;color:#fafafa}
+  label{display:block;font-size:13px;color:#a1a1aa;margin-bottom:4px}
+  input{width:100%;padding:10px 12px;border:1px solid #27272a;border-radius:8px;background:#09090b;color:#e4e4e7;font-size:14px;margin-bottom:12px;outline:none}
+  input:focus{border-color:#3f3f46}
+  button{width:100%;padding:10px;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:opacity .15s}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .btn-primary{background:#22c55e;color:#000}
+  .btn-primary:hover:not(:disabled){background:#16a34a}
+  .btn-secondary{background:#27272a;color:#e4e4e7;margin-top:8px}
+  .btn-secondary:hover:not(:disabled){background:#3f3f46}
+  .status{text-align:center;font-size:13px;color:#a1a1aa;margin:16px 0}
+  .status.error{color:#ef4444}
+  .status.ok{color:#22c55e}
+  .qr-box{display:flex;justify-content:center;margin:16px 0}
+  .qr-box canvas{border-radius:8px;border:4px solid #fff}
+  .hidden{display:none}
+  .log{margin-top:16px;max-height:180px;overflow-y:auto;font-size:11px;font-family:monospace;color:#71717a;background:#09090b;border:1px solid #27272a;border-radius:8px;padding:8px;white-space:pre-wrap;word-break:break-all}
+  .sse-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
+  .sse-dot.on{background:#22c55e}
+  .sse-dot.off{background:#ef4444}
+  .sse-dot.wait{background:#eab308}
+  .timer-bar{height:3px;background:#27272a;border-radius:2px;margin:8px 0;overflow:hidden}
+  .timer-bar .fill{height:100%;background:#22c55e;transition:width 1s linear;width:100%}
+  .session-list{margin-top:12px}
+  .session-item{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border:1px solid #27272a;border-radius:8px;margin-bottom:8px;background:#09090b;cursor:pointer;transition:border-color .15s}
+  .session-item:hover{border-color:#3f3f46}
+  .session-item.active{border-color:#22c55e}
+  .session-item .name{font-size:14px;color:#e4e4e7}
+  .session-item .state{font-size:12px;color:#a1a1aa}
+  .session-item .state.open{color:#22c55e}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>AstraCalls - Pareamento</h1>
+
+  <div id="setup">
+    <label>URL da API</label>
+    <input id="apiUrl" type="url" placeholder="http://servidor:8080">
+    <label>Chave de API</label>
+    <input id="apiKey" type="text" placeholder="sua-chave-api">
+    <button class="btn-primary" onclick="saveConfig()">Conectar</button>
+  </div>
+
+  <div id="main" class="hidden">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+      <span id="sseLabel" style="font-size:13px"><span class="sse-dot wait"></span>Conectando...</span>
+      <button class="btn-secondary" style="width:auto;padding:6px 14px;font-size:12px" onclick="createSession()">+ Nova conta</button>
+    </div>
+
+    <div id="sessionsBox" class="session-list hidden"></div>
+
+    <div id="pairPanel" class="hidden">
+      <div class="status" id="pairStatus">Aguardando QR...</div>
+      <div class="timer-bar" id="timerBar"><div class="fill" id="timerFill"></div></div>
+      <div class="qr-box"><canvas id="qrCanvas"></canvas></div>
+      <button class="btn-secondary" id="retryBtn" onclick="retryPair()" class="hidden">Gerar novo QR</button>
+      <button class="btn-secondary" onclick="deleteSession()">Excluir sessao</button>
+    </div>
+
+    <div id="loggedPanel" class="hidden">
+      <div class="status ok">Conectado ao WhatsApp</div>
+      <button class="btn-secondary" onclick="logoutSession()">Desconectar</button>
+      <button class="btn-secondary" onclick="deleteSession()">Excluir sessao</button>
+    </div>
+  </div>
+
+  <div class="log" id="log"></div>
+</div>
+
+<script>
+const $ = s => document.getElementById(s);
+let API = '', KEY = '', ES = null, SESSION_ID = null, QR_TIMER = null, EXPIRED = false;
+
+function log(msg) {
+  const el = $('log');
+  const t = new Date().toLocaleTimeString();
+  el.textContent += t + ' ' + msg + '\n';
+  el.scrollTop = el.scrollHeight;
+  console.log('[mini]', msg);
+}
+
+function loadConfig() {
+  $('apiUrl').value = localStorage.getItem('mc_url') || '';
+  $('apiKey').value = localStorage.getItem('mc_key') || '';
+}
+
+function saveConfig() {
+  const url = $('apiUrl').value.replace(/\/+$/, '');
+  const key = $('apiKey').value.trim();
+  if (!url || !key) return alert('Preencha URL e chave');
+  API = url; KEY = key;
+  localStorage.setItem('mc_url', url);
+  localStorage.setItem('mc_key', key);
+  $('setup').classList.add('hidden');
+  $('main').classList.remove('hidden');
+  connectSSE();
+  fetchSessions();
+}
+
+async function apiFetch(path, opts = {}) {
+  const sep = path.includes('?') ? '&' : '?';
+  const url = API + path + sep + 'apiKey=' + encodeURIComponent(KEY);
+  const r = await fetch(url, {
+    ...opts,
+    headers: { 'Content-Type': 'application/json', ...opts.headers }
+  });
+  if (!r.ok) throw new Error(await r.text());
+  if (r.status === 204) return null;
+  return r.json();
+}
+
+function connectSSE() {
+  if (ES) { ES.close(); ES = null; }
+  const clientId = localStorage.getItem('mc_client') || (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
+  localStorage.setItem('mc_client', clientId);
+  const url = API + '/api/events?clientId=' + encodeURIComponent(clientId) + '&apiKey=' + encodeURIComponent(KEY);
+  log('SSE conectando...');
+  $('sseLabel').innerHTML = '<span class="sse-dot wait"></span>Conectando...';
+
+  ES = new EventSource(url);
+  ES.onopen = () => {
+    log('SSE conectado');
+    $('sseLabel').innerHTML = '<span class="sse-dot on"></span>Conectado';
+  };
+  ES.onmessage = (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+      handleEvent(data);
+    } catch(e) { log('PARSE ERROR: ' + e.message); }
+  };
+  ES.onerror = () => {
+    log('SSE erro/desconectado');
+    $('sseLabel').innerHTML = '<span class="sse-dot off"></span>Desconectado - reconectando...';
+  };
+}
+
+function handleEvent(ev) {
+  if (ev.type === 'session-list') {
+    renderSessions(ev.sessions);
+    // check if our session got QR from session-list
+    if (SESSION_ID && ev.qr) {
+      // not in session-list, check sessions array
+    }
+    for (const s of ev.sessions) {
+      if (s.id === SESSION_ID && s.qr) {
+        showQR(s.qr);
+      }
+      if (s.id === SESSION_ID && s.state === 'open') {
+        showLogged();
+      }
+    }
+  } else if (ev.type === 'auth-state') {
+    if (ev.sessionId !== SESSION_ID) return;
+    log('auth-state: ' + ev.state + (ev.qr ? ' [QR]' : ''));
+    if (ev.state === 'qr' && ev.qr) {
+      showQR(ev.qr);
+    } else if (ev.state === 'open') {
+      showLogged();
+    } else if (ev.state === 'logged_out') {
+      $('pairStatus').textContent = 'Desconectado';
+      $('pairStatus').className = 'status error';
+      $('retryBtn').classList.remove('hidden');
+    }
+  } else if (ev.type === 'session-qr') {
+    if (ev.sessionId === SESSION_ID && ev.qr) {
+      showQR(ev.qr);
+    }
+  }
+}
+
+function renderSessions(sessions) {
+  const box = $('sessionsBox');
+  if (!sessions.length) { box.classList.add('hidden'); return; }
+  box.classList.remove('hidden');
+  box.innerHTML = sessions.map(s => {
+    const active = s.id === SESSION_ID ? ' active' : '';
+    const stateClass = s.state === 'open' ? ' open' : '';
+    const label = s.state === 'open' ? 'Conectado' : s.state === 'qr' ? 'QR disponivel' : s.state === 'connecting' ? 'Conectando...' : s.state || '...';
+    return '<div class="session-item' + active + '" onclick="selectSession(\'' + s.id + '\')">' +
+      '<span class="name">' + esc(s.name) + '</span>' +
+      '<span class="state' + stateClass + '">' + label + '</span>' +
+      '</div>';
+  }).join('');
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+let LAST_QR = '';
+
+async function fetchSessions() {
+  try {
+    const data = await apiFetch('/api/sessions');
+    const sessions = data.sessions || [];
+    renderSessions(sessions);
+    if (!SESSION_ID) return;
+    const s = sessions.find(x => x.id === SESSION_ID);
+    if (!s) return;
+    if (s.state === 'open') { showLogged(); return; }
+    if (s.qr && s.qr !== LAST_QR) {
+      LAST_QR = s.qr;
+      EXPIRED = false;
+      showQR(s.qr);
+    }
+  } catch(e) { log('fetchSessions erro: ' + e.message); }
+}
+
+async function createSession() {
+  try {
+    const data = await apiFetch('/api/sessions', { method: 'POST', body: JSON.stringify({ name: 'WhatsApp' }) });
+    SESSION_ID = data.id;
+    log('Sessao criada: ' + SESSION_ID);
+    showPairing();
+    fetchSessions();
+  } catch(e) { log('createSession erro: ' + e.message); }
+}
+
+function selectSession(id) {
+  SESSION_ID = id;
+  LAST_QR = '';
+  EXPIRED = false;
+  fetchSessions();
+  showPairing();
+}
+
+function showPairing() {
+  $('pairPanel').classList.remove('hidden');
+  $('loggedPanel').classList.add('hidden');
+  $('pairStatus').textContent = 'Aguardando QR...';
+  $('pairStatus').className = 'status';
+  $('retryBtn').classList.add('hidden');
+  startQRTimer();
+}
+
+function showQR(qr) {
+  if (EXPIRED) return;
+  log('QR recebido, length=' + qr.length);
+  $('pairStatus').textContent = 'Escaneie o QR code com o WhatsApp';
+  $('pairStatus').className = 'status';
+  $('retryBtn').classList.add('hidden');
+  QRCode.toCanvas($('qrCanvas'), qr, { width: 232, margin: 1 }, (err) => {
+    if (err) log('QR render error: ' + err);
+  });
+  startQRTimer();
+}
+
+function showLogged() {
+  $('pairPanel').classList.add('hidden');
+  $('loggedPanel').classList.remove('hidden');
+  clearQRTimer();
+  log('Sessao conectada!');
+}
+
+function startQRTimer() {
+  clearQRTimer();
+  EXPIRED = false;
+  let remaining = 20;
+  $('timerFill').style.width = '100%';
+  $('timerFill').style.background = '#22c55e';
+  QR_TIMER = setInterval(() => {
+    remaining--;
+    $('timerFill').style.width = (remaining / 20 * 100) + '%';
+    if (remaining <= 5) $('timerFill').style.background = '#ef4444';
+    if (remaining <= 0) {
+      clearQRTimer();
+      EXPIRED = true;
+      $('pairStatus').textContent = 'QR expirado';
+      $('pairStatus').className = 'status error';
+      $('retryBtn').classList.remove('hidden');
+    }
+  }, 1000);
+}
+
+function clearQRTimer() {
+  if (QR_TIMER) { clearInterval(QR_TIMER); QR_TIMER = null; }
+}
+
+async function retryPair() {
+  if (!SESSION_ID) return;
+  try {
+    EXPIRED = false;
+    LAST_QR = '';
+    $('pairStatus').textContent = 'Gerando novo QR...';
+    $('pairStatus').className = 'status';
+    $('retryBtn').classList.add('hidden');
+    await apiFetch('/api/sessions/' + SESSION_ID + '/pair', { method: 'POST' });
+    log('Pair solicitado');
+    startQRTimer();
+  } catch(e) { log('retryPair erro: ' + e.message); }
+}
+
+async function deleteSession() {
+  if (!SESSION_ID) return;
+  try {
+    await apiFetch('/api/sessions/' + SESSION_ID, { method: 'DELETE' });
+    log('Sessao deletada');
+    SESSION_ID = null;
+    $('pairPanel').classList.add('hidden');
+    $('loggedPanel').classList.add('hidden');
+    clearQRTimer();
+    fetchSessions();
+  } catch(e) { log('deleteSession erro: ' + e.message); }
+}
+
+async function logoutSession() {
+  if (!SESSION_ID) return;
+  try {
+    await apiFetch('/api/sessions/' + SESSION_ID + '/logout', { method: 'POST' });
+    log('Logout feito');
+    SESSION_ID = null;
+    $('pairPanel').classList.add('hidden');
+    $('loggedPanel').classList.add('hidden');
+    fetchSessions();
+  } catch(e) { log('logoutSession erro: ' + e.message); }
+}
+
+loadConfig();
+setInterval(fetchSessions, 2000);
+</script>
+</body>
+</html>

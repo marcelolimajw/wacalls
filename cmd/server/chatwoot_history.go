@@ -21,7 +21,7 @@ func (s *Session) importHistorySync(data *waHistorySync.HistorySync) {
 		return
 	}
 	cfg := s.getChatwoot()
-	if !cfg.valid() || !cfg.ImportHistory {
+	if !cfg.valid() || !cfg.ImportHistory || cfg.DisableMessageRelay {
 		return
 	}
 	days := cfg.ImportHistoryDays

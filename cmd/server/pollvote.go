@@ -99,7 +99,7 @@ func (s *Session) handleIncomingPollVote(evt *events.Message) {
 		"timestamp":     evt.Info.Timestamp.UnixMilli(),
 	})
 
-	if cfg := s.getChatwoot(); cfg.valid() {
+	if cfg := s.getChatwoot(); cfg.valid() && !cfg.DisableMessageRelay {
 		s.chatwootPushVote(cfg, evt, pollVoteText(voter, names))
 	}
 }

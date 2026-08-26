@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { Loader2, ShieldCheck, KeyRound, QrCode, Smartphone } from "lucide-react";
+import { useEffect, useRef, useState, useCallback } from "react";
+import { Loader2, ShieldCheck, KeyRound, QrCode, Smartphone, RefreshCw, WifiOff } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -7,13 +7,15 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useSessions, setPairingCode } from "@/stores/sessions";
-import { submitPasskeyAssertion, pairSessionCode } from "@/services/sessions";
+import { submitPasskeyAssertion, pairSessionCode, pairSession } from "@/services/sessions";
 import {
   isExtensionInstalled,
   runPasskeyAssertion,
   EXTENSION_DOWNLOAD_URL,
 } from "@/lib/passkey";
 import type { SessionInfo } from "@/types/session";
+
+const QR_EXPIRY_SECONDS = 20;
 
 const PasskeyStep = ({ session }: { session: SessionInfo }) => {
   const publicKey = useSessions((s) => s.passkeys[session.id]);
@@ -185,10 +187,63 @@ const CodeStep = ({ session }: { session: SessionInfo }) => {
 export const SessionPairing = ({ session }: { session: SessionInfo }) => {
   const qr = useSessions((s) => s.qrs[session.id]);
   const hasCode = useSessions((s) => !!s.codes[session.id]);
+  const sseStatus = useSessions((s) => s.sseStatus);
   const isPasskey = session.state === "passkey_request";
   const [mode, setMode] = useState<"qr" | "code">(
     session.state === "pairing_code" || hasCode ? "code" : "qr",
   );
+  const [qrExpired, setQrExpired] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [connectTimeout, setConnectTimeout] = useState(false);
+  const [retryTick, setRetryTick] = useState(0);
+  const qrTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const connectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const qrKeyRef = useRef(0);
+
+  const clearQrTimer = useCallback(() => {
+    if (qrTimerRef.current) {
+      clearTimeout(qrTimerRef.current);
+      qrTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    clearQrTimer();
+    setQrExpired(false);
+    if (qr) {
+      qrKeyRef.current += 1;
+      qrTimerRef.current = setTimeout(() => setQrExpired(true), QR_EXPIRY_SECONDS * 1000);
+    }
+    return clearQrTimer;
+  }, [qr, clearQrTimer]);
+
+  useEffect(() => {
+    if (connectTimerRef.current) {
+      clearTimeout(connectTimerRef.current);
+      connectTimerRef.current = null;
+    }
+    setConnectTimeout(false);
+    if (!qr && session.state !== "logged_out" && session.state !== "qr") {
+      connectTimerRef.current = setTimeout(() => setConnectTimeout(true), 20000);
+    }
+    return () => {
+      if (connectTimerRef.current) clearTimeout(connectTimerRef.current);
+    };
+  }, [qr, session.state, retryTick]);
+
+  const handleRetry = async () => {
+    setRetrying(true);
+    setConnectTimeout(false);
+    setRetryTick((t) => t + 1);
+    try {
+      await pairSession(session.id);
+    } catch {
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  const sseDisconnected = sseStatus === "disconnected";
 
   return (
     <div className="flex min-h-[55vh] items-center justify-center">
@@ -202,11 +257,17 @@ export const SessionPairing = ({ session }: { session: SessionInfo }) => {
           )}
         </CardHeader>
         <CardContent className="flex flex-col items-center gap-4">
+          {sseDisconnected && (
+            <div className="flex w-full items-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              <WifiOff className="h-4 w-4 shrink-0" />
+              Conexão com o servidor perdida. Reconectando…
+            </div>
+          )}
+
           {isPasskey ? (
             <PasskeyStep session={session} />
           ) : (
             <>
-              {/* Seletor de método: QR ou código por número */}
               <div className="flex w-full rounded-lg border p-1">
                 <button
                   type="button"
@@ -230,12 +291,61 @@ export const SessionPairing = ({ session }: { session: SessionInfo }) => {
 
               {mode === "code" ? (
                 <CodeStep session={session} />
-              ) : qr ? (
-                <div className="rounded-lg border bg-white p-3">
-                  <QRCodeSVG value={qr} size={232} marginSize={1} />
+              ) : qr && !qrExpired ? (
+                <div className="flex flex-col items-center gap-3">
+                  <div className="rounded-lg border bg-white p-3">
+                    <QRCodeSVG key={qrKeyRef.current} value={qr} size={232} marginSize={1} />
+                  </div>
+                  <Badge variant="muted" className="gap-1.5">
+                    <Loader2 className="h-3 w-3 animate-spin" /> Escaneie antes que expire…
+                  </Badge>
+                </div>
+              ) : qrExpired ? (
+                <div className="flex flex-col items-center gap-3">
+                  <div className="rounded-lg border bg-white/50 p-3 opacity-50">
+                    <QRCodeSVG value={qr} size={232} marginSize={1} />
+                  </div>
+                  <Badge variant="destructive" className="gap-1.5">
+                    QR expirado
+                  </Badge>
+                  <Button onClick={() => void handleRetry()} disabled={retrying} size="sm" className="gap-1.5">
+                    {retrying ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-4 w-4" />
+                    )}
+                    Gerar novo QR
+                  </Button>
                 </div>
               ) : session.state === "logged_out" ? (
-                <Badge variant="destructive">Desconectado — use Reativar acima para gerar um QR</Badge>
+                <div className="flex flex-col items-center gap-3">
+                  <Badge variant="destructive">Desconectado</Badge>
+                  <Button onClick={() => void handleRetry()} disabled={retrying} size="sm" className="gap-1.5">
+                    {retrying ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-4 w-4" />
+                    )}
+                    Reconectar
+                  </Button>
+                </div>
+              ) : connectTimeout ? (
+                <div className="flex flex-col items-center gap-3">
+                  <Badge variant="destructive" className="gap-1.5">
+                    <WifiOff className="h-3 w-3" /> Não foi possível conectar ao WhatsApp
+                  </Badge>
+                  <p className="text-center text-sm text-muted-foreground">
+                    Verifique se o container wacalls está rodando e se o PostgreSQL está acessível. Confira os logs do container.
+                  </p>
+                  <Button onClick={() => void handleRetry()} disabled={retrying} size="sm" className="gap-1.5">
+                    {retrying ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-4 w-4" />
+                    )}
+                    Tentar novamente
+                  </Button>
+                </div>
               ) : (
                 <>
                   <Skeleton className="h-[258px] w-[258px] rounded-lg" />

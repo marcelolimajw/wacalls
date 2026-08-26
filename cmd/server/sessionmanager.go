@@ -120,7 +120,28 @@ func (m *SessionManager) infos() []SessionInfo {
 }
 
 func (m *SessionManager) snapshotEvents() []any {
-	return []any{map[string]any{"type": "session-list", "sessions": m.infos()}}
+	events := []any{map[string]any{"type": "session-list", "sessions": m.infos()}}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, s := range m.sessions {
+		s.mu.Lock()
+		a := s.auth
+		s.mu.Unlock()
+		if !a.Paired && (a.QR != "" || a.Code != "" || len(a.Passkey) > 0) {
+			ev := map[string]any{
+				"type": "auth-state", "sessionId": s.id,
+				"paired": false, "state": a.State, "qr": a.QR,
+			}
+			if a.Code != "" {
+				ev["code"] = a.Code
+			}
+			if len(a.Passkey) > 0 {
+				ev["passkey"] = a.Passkey
+			}
+			events = append(events, ev)
+		}
+	}
+	return events
 }
 
 func (m *SessionManager) Restore(ctx context.Context) error {

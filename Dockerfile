@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 # ---------- Stage 1: build do client React ----------
 FROM node:22-bookworm AS client
 WORKDIR /app/client
@@ -68,4 +66,4 @@ COPY --from=server /astracalls-passkey.zip /app/client/dist/astracalls-passkey.z
 WORKDIR /app
 EXPOSE 8080 50000
 ENTRYPOINT ["wacalls"]
-CMD ["-addr", ":8080", "-static", "/app/client/dist", "-db", "/data/wacalls.db"]
+CMD ["-addr", ":8080", "-static", "/app/client/dist"]

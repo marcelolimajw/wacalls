@@ -228,7 +228,7 @@ func (s *Session) handleIncomingEventResponse(evt *events.Message) {
 		"timestamp":      evt.Info.Timestamp.UnixMilli(),
 	})
 
-	if cfg := s.getChatwoot(); cfg.valid() {
+	if cfg := s.getChatwoot(); cfg.valid() && !cfg.DisableMessageRelay {
 		s.chatwootPushVote(cfg, evt, emoji+" "+who+" "+label+" (evento)")
 	}
 }

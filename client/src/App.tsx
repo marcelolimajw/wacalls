@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { PlusCircle } from "lucide-react";
+import { PlusCircle, Loader2 } from "lucide-react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "@/components/ui/sonner";
 import { AppShell } from "@/components/layout/AppShell";
@@ -16,6 +16,7 @@ import { useTheme } from "@/stores/theme";
 export const App = () => {
   const sessions = useSessions((s) => s.sessions);
   const activeId = useSessions((s) => s.activeId);
+  const sseStatus = useSessions((s) => s.sseStatus);
   const theme = useTheme((s) => s.theme);
 
   useEffect(() => {
@@ -24,11 +25,18 @@ export const App = () => {
   }, []);
 
   const active = sessions.find((s) => s.id === activeId) ?? null;
+  const initialLoading = sessions.length === 0 && sseStatus === "connecting";
 
   return (
     <TooltipProvider delayDuration={200}>
       <AppShell>
-        {sessions.length === 0 ? (
+        {initialLoading ? (
+          <EmptyState
+            icon={<Loader2 className="h-6 w-6 animate-spin" />}
+            title="Conectando ao servidor…"
+            description="Aguarde um momento."
+          />
+        ) : sessions.length === 0 ? (
           <EmptyState
             icon={<PlusCircle className="h-6 w-6" />}
             title="Nenhuma conta ainda"
