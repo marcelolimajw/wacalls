@@ -27,7 +27,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE: astraonline/astracalls
+  IMAGE: marcelolimajw/wats-voz
 
 jobs:
   build:
