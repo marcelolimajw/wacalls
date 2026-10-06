@@ -87,6 +87,9 @@ número — a mesma sessão serve chamadas, mensagens e Chatwoot.
 adiciona um **botão de telefone na conversa**. Faz a chamada WebRTC direto do navegador do
 agente, **abre e toca automaticamente quando chega uma ligação**, mostra "Chamando…" até o
 outro lado atender, inicia o cronômetro só na conexão real e silencia o toque ao atender.
+Na chamada ativa há botão de **câmera para ligar em vídeo** (H264 160×120 via WebCodecs).
+Passo a passo, segurança da chave, troubleshooting e referência de API em
+[**INTEGRACAO_CHATWOOT.md**](INTEGRACAO_CHATWOOT.md).
 
 ### 🔐 Autenticação por API key
 Middleware `withAuth`: se `WACALLS_API_KEY` estiver setada, todas as rotas `/api/*` exigem
