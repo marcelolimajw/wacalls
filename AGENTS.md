@@ -5,7 +5,7 @@ AstraCalls. Foco na **build da imagem Docker** e no **deploy**.
 
 ## Regra de ouro da imagem: multi-arch obrigatório
 
-A imagem `astraonline/astracalls` **precisa servir `linux/amd64` E `linux/arm64`**.
+A imagem `marcelolimajw/wats-voz` **precisa servir `linux/amd64` E `linux/arm64`**.
 O `Dockerfile` é arch-aware (compila o codec MLow com NEON no ARM e baseline
 SSE2 no x86). Uma build single-arch (`docker build` comum) gera um manifesto de
 uma arquitetura só — **isso é considerado quebrado**.
@@ -51,7 +51,7 @@ antes e depois, e monte o manifesto com `docker buildx imagetools create`.
 
 ```bash
 docker service update --with-registry-auth \
-  --image astraonline/astracalls:develop wacalls_wacalls
+  --image marcelolimajw/wats-voz:0.2.0 wacalls_wacalls
 ```
 
 Num nó amd64 o manifesto resolve automaticamente para o sub-manifesto amd64.

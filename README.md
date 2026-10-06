@@ -235,13 +235,13 @@ npm run dev      # Vite na :5173, faz proxy de /api → http://localhost:8080
 ## 🐳 Deploy em produção (Docker Swarm + Traefik)
 
 ```bash
-# imagem oficial publicada no Docker Hub:
-#   astraonline/astracalls:develop   (ou uma tag estável, ex.: astraonline/astracalls:v0.0.2)
+# imagem publicada no Docker Hub:
+#   marcelolimajw/wats-voz:0.2.0   (tag estável; o CI também publica :main / :vX.Y.Z)
 # para usar direto, basta referenciá-la na stack (PullImage).
 
 # para buildar a sua própria a partir do código:
-docker build -t astraonline/astracalls:develop .
-docker push astraonline/astracalls:develop
+docker build -t marcelolimajw/wats-voz:0.2.0 .
+docker push marcelolimajw/wats-voz:0.2.0
 
 # deploy da stack (Postgres + servidor em rede de host + proxy Traefik)
 docker stack deploy -c astracalls-stack.yml astracalls
