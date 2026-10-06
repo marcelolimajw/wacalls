@@ -35,6 +35,7 @@ export const Sidebar = ({ onNavigate }: { onNavigate?: () => void }) => {
         id,
         name: "WhatsApp",
         jid: "",
+        lastJid: "",
         state: "connecting",
         paired: false,
         recording: false,
