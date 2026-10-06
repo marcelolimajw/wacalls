@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"wacalls/internal/voip/call"
@@ -35,16 +38,43 @@ type Session struct {
 	client *whatsmeow.Client
 	reg    *callRegistry
 
+	// cache número(PN)->JID canônico do WhatsApp (via IsOnWhatsApp). Corrige o 9º
+	// dígito brasileiro: o WhatsApp registra o número numa forma canônica (às vezes
+	// sem o 9) e o whatsmeow novo recusa enviar a um PN cujo LID não resolve
+	// ("no LID found"). thread-safe (sync.Map), sem init.
+	canonCache sync.Map
+
 	// store próprio desta sessão (1 banco por sessão)
 	waContainer *sqlstore.Container
 	waDB        *sql.DB
 
-	mu        sync.Mutex
-	auth      AuthSnapshot
-	webhook   string
-	chatwoot  ChatwootConfig
-	recording bool   // grava as chamadas desta sessão (opt-in)
-	proxy     string // proxy de saída da conexão WhatsApp (http/https/socks5)
+	mu            sync.Mutex
+	auth          AuthSnapshot
+	webhook       string
+	webhookSecret string   // segredo p/ assinar o payload (X-Webhook-Signature); vazio = sem assinatura
+	webhookEvents []string // filtro: só entrega estes tipos de evento; vazio = todos
+	chatwoot      ChatwootConfig
+	recording     bool   // grava as chamadas desta sessão (opt-in)
+	proxy         string // proxy de saída da conexão WhatsApp (http/https/socks5)
+	lastJID       string // último número (JID) que esteve conectado; mantido após desconectar
+
+	// Credenciais SIP desta sessão (modelo Wavoip: o PBX do cliente se registra
+	// no AstraCalls usando estes dados). Definidas na criação da sessão.
+	SIPUser string
+	SIPPass string
+	SIPURL  string
+
+	// Modelo 2 (UAC): esta sessão se REGISTRA num PBX externo. Protegido por s.mu.
+	SIPExtEnabled bool
+	SIPExtHost    string
+	SIPExtPort    int
+	SIPExtUser    string
+	SIPExtPass    string
+	SIPExtDest    string
+	// estado do registro no PBX externo (registering/registered/failed), atualizado
+	// pelo registrador UAC; exibido no painel. Protegido por s.mu.
+	sipExtStatus string
+	sipExtError  string
 
 	// downAlerted evita repetir o aviso de "sessão desconectada" no Chatwoot
 	// enquanto ela segue caída; volta a false ao reconectar (events.Connected).
@@ -108,8 +138,29 @@ func (s *Session) selfSentOrigin(id string) (origin string, ok bool) {
 
 // sendAndMark envia uma mensagem, a registra como "enviada por nós" e devolve o
 // ID da mensagem do WhatsApp (usado p/ gravar o source_id no Chatwoot).
+// sendResolvingLID envia a mensagem e, no erro "no LID found" (número sem
+// mapeamento PN↔LID no store — ex.: 9º dígito BR), resolve o LID+PN canônicos via
+// IsOnWhatsApp, GRAVA o mapeamento e reenvia PELO PN (e por fim pelo @lid cru).
+// Usado por TODOS os envios (sendTo/API e sendAndMark/Chatwoot) para que o 9º
+// dígito não quebre nenhum caminho de envio.
+func (s *Session) sendResolvingLID(ctx context.Context, jid types.JID, msg *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+	resp, err := s.client.SendMessage(ctx, jid, msg, extra...)
+	if err != nil && isLIDResolveErr(err) && jid.Server == types.DefaultUserServer {
+		if lid, pn, ok := s.resolveCanonical(ctx, jid); ok {
+			s.client.StoreLIDPNMapping(ctx, lid, pn)
+			s.log.Info("reenvio após gravar mapeamento LID", "orig", jid.String(), "lid", lid.String(), "pn", pn.String())
+			resp, err = s.client.SendMessage(ctx, pn, msg, extra...)
+			if err != nil {
+				s.log.Warn("envio pelo PN falhou; tentando @lid direto", "err", err, "lid", lid.String())
+				resp, err = s.client.SendMessage(ctx, lid, msg, extra...)
+			}
+		}
+	}
+	return resp, err
+}
+
 func (s *Session) sendAndMark(ctx context.Context, jid types.JID, msg *waE2E.Message) (string, error) {
-	resp, err := s.client.SendMessage(ctx, jid, msg)
+	resp, err := s.sendResolvingLID(ctx, jid, msg)
 	if err != nil {
 		return "", err
 	}
@@ -117,9 +168,62 @@ func (s *Session) sendAndMark(ctx context.Context, jid types.JID, msg *waE2E.Mes
 	return resp.ID, nil
 }
 
-func (s *Session) setWebhook(url string) {
+// isLIDResolveErr indica que o whatsmeow não conseguiu resolver o LID do
+// destinatário (novo requisito do WhatsApp) — normalmente por o número (PN)
+// estar num formato que o servidor não reconhece.
+func isLIDResolveErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	e := err.Error()
+	return strings.Contains(e, "no LID found") || strings.Contains(e, "get LID for PN")
+}
+
+type canonInfo struct {
+	lid types.JID
+	pn  types.JID
+	ok  bool
+}
+
+// resolveCanonical consulta IsOnWhatsApp e devolve o LID e o PN canônicos do
+// número (corrige o 9º dígito brasileiro — o WhatsApp devolve a forma real
+// registrada + o LID). Cacheia por sessão. ok=false se o número não é registrado
+// ou não tem LID. O pn devolvido é sempre um @s.whatsapp.net (o canônico, ou o
+// original como fallback) para casar com StoreLIDPNMapping/GetLIDForPN.
+func (s *Session) resolveCanonical(ctx context.Context, jid types.JID) (types.JID, types.JID, bool) {
+	if jid.User == "" {
+		return types.JID{}, types.JID{}, false
+	}
+	if v, ok := s.canonCache.Load(jid.User); ok {
+		ci := v.(canonInfo)
+		return ci.lid, ci.pn, ci.ok
+	}
+	resp, err := s.client.IsOnWhatsApp(ctx, []string{"+" + jid.User})
+	if err != nil || len(resp) == 0 || !resp[0].IsIn {
+		s.canonCache.Store(jid.User, canonInfo{ok: false})
+		return types.JID{}, types.JID{}, false
+	}
+	it := resp[0]
+	lid := it.JID.ToNonAD()
+	pn := it.PhoneNumber.ToNonAD()
+	if pn.IsEmpty() || pn.Server != types.DefaultUserServer {
+		pn = jid.ToNonAD() // fallback: PN original
+	}
+	// só é útil quando temos um LID de verdade (@lid) pra gravar/mapear
+	if lid.IsEmpty() || lid.Server != types.HiddenUserServer {
+		s.canonCache.Store(jid.User, canonInfo{ok: false})
+		return types.JID{}, types.JID{}, false
+	}
+	ci := canonInfo{lid: lid, pn: pn, ok: true}
+	s.canonCache.Store(jid.User, ci)
+	return lid, pn, true
+}
+
+func (s *Session) setWebhook(url, secret string, events []string) {
 	s.mu.Lock()
 	s.webhook = url
+	s.webhookSecret = secret
+	s.webhookEvents = events
 	s.mu.Unlock()
 }
 
@@ -127,6 +231,35 @@ func (s *Session) getWebhook() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.webhook
+}
+
+func (s *Session) getWebhookSecret() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.webhookSecret
+}
+
+func (s *Session) getWebhookEvents() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.webhookEvents
+}
+
+// webhookWants diz se o evento deve ser entregue conforme o filtro da sessão.
+// Filtro vazio = entrega tudo (comportamento antigo).
+func (s *Session) webhookWants(event string) bool {
+	s.mu.Lock()
+	ev := s.webhookEvents
+	s.mu.Unlock()
+	if len(ev) == 0 {
+		return true
+	}
+	for _, e := range ev {
+		if e == event {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Session) setChatwoot(c ChatwootConfig) {
@@ -197,7 +330,70 @@ func newSession(mgr *SessionManager, id, name string, client *whatsmeow.Client) 
 		reg:    newCallRegistry(),
 	}
 	client.AddEventHandler(s.handleEvent)
+	go s.runPresenceKeepalive()
 	return s
+}
+
+// keepPresenceActive marca a conta como disponível para o WhatsApp registrar
+// atividade do dispositivo vinculado e não removê-lo por inatividade. Ignora
+// silenciosamente ErrNoPushName (o pushname ainda não chegou; reenviamos no
+// evento PushNameSetting) e só loga outras falhas em debug.
+func (s *Session) keepPresenceActive(ctx context.Context) {
+	// Sem pushname o WhatsApp recusa a presença (ErrNoPushName) e o dispositivo
+	// nunca é marcado como ativo. No Connected há uma corrida: o pushname pode
+	// ainda não ter sido carregado do store/app-state. Esperamos alguns segundos
+	// pelo nome real antes de recorrer a um fallback (evita broadcastar o nome
+	// genérico quando o real está a caminho). Se mesmo assim não vier, usamos o
+	// fallback só para habilitar a presença — o nome real é reenviado no próximo
+	// ciclo (PushNameSetting ou keepalive).
+	for i := 0; i < 5 && len(s.client.Store.PushName) == 0; i++ {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+	if len(s.client.Store.PushName) == 0 {
+		s.client.Store.PushName = presenceFallbackName
+	}
+	err := s.client.SendPresence(ctx, types.PresenceAvailable)
+	if err != nil {
+		if errors.Is(err, whatsmeow.ErrNoPushName) {
+			s.log.Warn("keepalive presence: sem pushname, presença não enviada")
+		} else {
+			s.log.Warn("keepalive presence falhou", "err", err)
+		}
+		return
+	}
+	s.log.Info("keepalive presence enviada", "pushname", s.client.Store.PushName)
+}
+
+// presenceFallbackName é o pushname usado apenas quando o aparelho não propaga o
+// nome real para este dispositivo — necessário para o WhatsApp aceitar a presença
+// e manter o companion ativo. É sobrescrito pelo nome real no PushNameSetting.
+const presenceFallbackName = "WhatsApp"
+
+// presenceKeepaliveInterval reforça a presença periodicamente: uma conexão
+// estável pode ficar dias no ar sem reconectar, e a "última sessão ativa" só é
+// atualizada quando enviamos presença — sem esse reforço a data envelhece e o
+// WhatsApp acaba agendando a remoção do dispositivo por inatividade.
+const presenceKeepaliveInterval = 6 * time.Hour
+
+// runPresenceKeepalive vive junto com a sessão (encerra no shutdown do app) e
+// reenvia a presença available enquanto a conta estiver conectada e pareada.
+func (s *Session) runPresenceKeepalive() {
+	ticker := time.NewTicker(presenceKeepaliveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.mgr.appCtx.Done():
+			return
+		case <-ticker.C:
+			if s.client.IsConnected() && s.client.IsLoggedIn() {
+				s.keepPresenceActive(s.mgr.appCtx)
+			}
+		}
+	}
 }
 
 // createCall monta a chamada. record liga a gravação nesta chamada específica —
@@ -219,25 +415,65 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		// telefone real (PN) e, se der, pro nome do contato — senão a UI/widget
 		// mostra o LID cru (issue #9).
 		phone, name := s.resolvePeer(c.PeerJid)
+		// se o LID não resolveu pelo mapa local, usa o caller_pn que o offer trouxe.
+		if phone == "" && c.CallerPn != "" {
+			phone = digitsOnly(c.CallerPn)
+		}
+		// peer EXPOSTO = PN (resolvido ou do offer) ou vazio, NUNCA o LID cru (senão o
+		// widget/integração faz `phone || peer` e cria contato lixo — bug 01/10).
+		peerOut := phone
 		s.mgr.broker.upsertCall(CallRecord{
-			SessionID: s.id, CallID: c.CallID, Direction: "inbound", Peer: c.PeerJid,
+			SessionID: s.id, CallID: c.CallID, Direction: "inbound", Peer: peerOut,
 			StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
 		})
-		s.mgr.broker.emitIncoming(s.id, c.CallID, c.PeerJid, phone, name, c.MediaType == core.CallMediaTypeVideo)
+		// diagnóstico: mostra o account_id da sessão e quantos assinantes vão
+		// receber. subs_matched inclui o painel (accountID 0); se um widget está
+		// aberto na conta certa, ele entra no matched — senão cai em
+		// subs_widget_other_acct (conta divergente) ou nem aparece (não conectou).
+		acct, total, matched, otherAcct := s.mgr.broker.subscriberScope(s.id)
+		s.log.Info("incoming call: broadcasting", "callID", c.CallID, "peer", c.PeerJid,
+			"acct", acct, "subs_total", total, "subs_matched", matched, "subs_widget_other_acct", otherAcct)
+		s.mgr.broker.emitIncoming(s.id, c.CallID, peerOut, phone, name, c.MediaType == core.CallMediaTypeVideo)
+		// se um tronco SIP está registrado, toca essa chamada no ramal também.
+		if s.mgr.sipInbound != nil {
+			s.mgr.sipInbound(s, c.CallID, sipUserPart(c.PeerJid))
+		}
 	}
 	cm.OnStateChange = func(c *call.CallInfo) {
 		if c.IsEnded() {
+			// avisa o consumidor do WS (se abriu com ?events=1) antes de fechar.
+			s.wsCallEvent(c.CallID, map[string]any{"type": "call-ended", "reason": string(c.StateData.EndReason)})
+			if ac, ok := s.reg.get(c.CallID); ok && ac.rtpBridge != nil {
+				ac.rtpBridge.NotifyEnded(string(c.StateData.EndReason))
+			}
 			s.removeCall(c.CallID)
 			s.mgr.broker.endCall(c.CallID, string(c.StateData.EndReason))
 			return
+		}
+		// espelha a mudança de estado no WS (connected/hold/etc.) para o consumidor.
+		s.wsCallEvent(c.CallID, map[string]any{"type": "call-status", "status": mapStatus(c.StateData.State)})
+		// SIP: quando a chamada WhatsApp fica ativa, libera o 200 OK do lado SIP.
+		if c.IsActive() {
+			if ac, ok := s.reg.get(c.CallID); ok {
+				// atendida: marca e cancela o timeout de toque (não expirar).
+				ac.answered.Store(true)
+				s.reg.stopRingTimer(c.CallID)
+				if ac.rtpBridge != nil {
+					ac.rtpBridge.NotifyActive()
+				}
+			}
 		}
 		dir := "outbound"
 		if c.Direction == core.CallDirectionIncoming {
 			dir = "inbound"
 		}
 		existing, _ := s.mgr.broker.getCall(c.CallID)
+		peerOut := s.callPeerOut(c.PeerJid)
+		if peerOut == "" && c.CallerPn != "" {
+			peerOut = digitsOnly(c.CallerPn)
+		}
 		rec := CallRecord{
-			SessionID: s.id, CallID: c.CallID, Direction: dir, Peer: c.PeerJid,
+			SessionID: s.id, CallID: c.CallID, Direction: dir, Peer: peerOut,
 			StartedAt: time.Now().UnixMilli(), Status: mapStatus(c.StateData.State),
 			Held: c.StateData.State == core.CallStateOnHold,
 		}
@@ -248,6 +484,10 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		s.mgr.broker.upsertCall(rec)
 	}
 	cm.OnEnded = func(c *call.CallInfo) {
+		s.wsCallEvent(c.CallID, map[string]any{"type": "call-ended", "reason": string(c.StateData.EndReason)})
+		if ac, ok := s.reg.get(c.CallID); ok && ac.rtpBridge != nil {
+			ac.rtpBridge.NotifyEnded(string(c.StateData.EndReason))
+		}
 		s.removeCall(c.CallID)
 		s.mgr.broker.endCall(c.CallID, string(c.StateData.EndReason))
 	}
@@ -256,17 +496,34 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		if !ok {
 			return
 		}
-		// grava o lado do peer (WhatsApp) mesmo se o navegador ainda não estiver pronto
+		// diagnóstico (opt-in): confirma que o áudio do peer (WhatsApp) chega e se há ponte SIP.
+		if sipDebugEnabled {
+			n := atomic.AddUint64(&ac.peerAudioN, 1)
+			if n == 1 || n%500 == 0 {
+				s.log.Info("peer audio (WhatsApp->consumidor)", "call_id", callID, "frames", n,
+					"has_sip", ac.rtpBridge != nil, "has_ws", ac.wsBridge != nil, "has_webrtc", ac.bridge != nil, "samples", len(pcm16))
+			}
+		}
+		// grava o lado do peer (WhatsApp) mesmo se o consumidor ainda não estiver pronto
 		ac.recorder.writePeer(pcm16)
-		if ac.bridge == nil || ac.browserOpus == nil {
+		// ponte SIP (G.711 u-law): recebe o PCM 16kHz direto (chamada SIP não usa WS/WebRTC).
+		if ac.rtpBridge != nil {
+			_ = ac.rtpBridge.WritePCM(pcm16)
+		}
+		// ponte WebSocket: envia PCM16 direto, sem Opus (menos CPU/latência).
+		if ws := ac.wsBridge; ws != nil {
+			_ = ws.WritePCM(pcm16)
 			return
 		}
-		pcm48 := media.Upsample16to48(pcm16)
-		opus, err := ac.browserOpus.Encode(pcm48)
-		if err != nil || len(opus) == 0 {
-			return
+		// ponte WebRTC (pion): o navegador espera Opus/RTP.
+		if ac.bridge != nil && ac.browserOpus != nil {
+			pcm48 := media.Upsample16to48(pcm16)
+			opus, err := ac.browserOpus.Encode(pcm48)
+			if err != nil || len(opus) == 0 {
+				return
+			}
+			_ = ac.bridge.WriteOpus(opus, 60*time.Millisecond)
 		}
-		_ = ac.bridge.WriteOpus(opus, 60*time.Millisecond)
 	}
 	cm.OnPeerVideo = func(au []byte) {
 		ac, ok := s.reg.get(callID)
@@ -312,6 +569,13 @@ func (s *Session) callForEvent(from types.JID, data *waBinary.Node) (*activeCall
 	return s.reg.get(callID)
 }
 
+// ringTimeoutSecs: segundos até expirar uma chamada de entrada que fica tocando
+// e NUNCA recebe encerramento do WhatsApp (perdida/cancelada antes de conectar,
+// queda de rede). Sem isso a chamada ficava pendurada pra sempre, entupindo o
+// limite (WACALLS_MAX_CALLS) e fazendo novas chamadas serem recusadas sozinhas —
+// só um restart do processo liberava. 0 desliga o timeout.
+var ringTimeoutSecs = envInt("WACALLS_RING_TIMEOUT_SECONDS", 60)
+
 func (s *Session) onIncomingOffer(ctx context.Context, evt *events.CallOffer) {
 	node := wrapCall(evt.From, evt.Data)
 	callID := callIDFromNode(node)
@@ -323,7 +587,48 @@ func (s *Session) onIncomingOffer(ctx context.Context, evt *events.CallOffer) {
 		return
 	}
 	cm := s.createCall(callID, s.getRecording())
-	cm.HandleCallOffer(ctx, node, evt.From)
+	// telefone real do chamador: o offer traz caller_pn em CallCreatorAlt quando o
+	// creator é LID; ou o próprio CallCreator já é PN. Evita "desconhecido" sem
+	// depender do mapa local de LID (bug 01/10).
+	callerPn := ""
+	if evt.CallCreator.Server == types.DefaultUserServer {
+		callerPn = evt.CallCreator.User
+	} else if evt.CallCreatorAlt.Server == types.DefaultUserServer {
+		callerPn = evt.CallCreatorAlt.User
+	}
+	cm.HandleCallOffer(ctx, node, evt.From, callerPn)
+	s.armRingTimeout(callID)
+}
+
+// armRingTimeout agenda a expiração da chamada tocando (ver ringTimeoutSecs). É
+// cancelado quando a chamada é atendida (OnStateChange ativo) ou encerra
+// (removeCall/drain param o timer).
+func (s *Session) armRingTimeout(callID string) {
+	if ringTimeoutSecs <= 0 {
+		return
+	}
+	t := time.AfterFunc(time.Duration(ringTimeoutSecs)*time.Second, func() {
+		s.expireRingingCall(callID)
+	})
+	s.reg.setRingTimer(callID, t)
+}
+
+// expireRingingCall encerra uma chamada que ficou tocando além do timeout sem
+// nunca ter sido atendida nem recebido encerramento. Recusa no WhatsApp, avisa
+// TODOS os assinantes (call-ended) e libera a vaga.
+func (s *Session) expireRingingCall(callID string) {
+	ac, ok := s.reg.get(callID)
+	if !ok {
+		return // já encerrou normalmente
+	}
+	if ac.answered.Load() {
+		return // atendida (corrida com o timer): não expira
+	}
+	s.log.Info("chamada expirada por timeout de toque (nunca recebeu encerramento do WhatsApp)",
+		"call_id", callID, "timeout_s", ringTimeoutSecs)
+	_ = ac.cm.RejectCall(s.mgr.appCtx, callID, core.EndCallReasonTimeout)
+	s.removeCall(callID)
+	s.mgr.broker.endCall(callID, string(core.EndCallReasonTimeout))
 }
 
 func (s *Session) rejectOffer(ctx context.Context, node *waBinary.Node, from types.JID) {
@@ -335,8 +640,13 @@ func (s *Session) rejectOffer(ctx context.Context, node *waBinary.Node, from typ
 	if creator == "" {
 		creator = from.String()
 	}
-	reject := signaling.BuildRejectStanza(from, info.CallID, wanode.MustJID(creator))
-	_ = wa.NewSocket(s.client).SendNode(ctx, reject)
+	sock := wa.NewSocket(s.client)
+	own := sock.OwnLID()
+	if from.Server == types.DefaultUserServer {
+		own = sock.OwnPN()
+	}
+	reject := signaling.BuildRejectStanza(from, info.CallID, wanode.MustJID(creator), own)
+	_ = sock.SendNode(ctx, reject)
 	s.log.Info("inbound call rejected: session at capacity", "call_id", info.CallID)
 }
 
@@ -370,10 +680,17 @@ func (s *Session) handleEvent(rawEvt any) {
 		s.mu.Lock()
 		s.downAlerted = false
 		s.mu.Unlock()
-		// always_online: mantém a presença sempre disponível (reenvia a cada reconexão).
-		if s.getChatwoot().AlwaysOnline {
-			go func() { _ = s.client.SendPresence(ctx, types.PresenceAvailable) }()
-		}
+		// Marca o dispositivo como ativo no WhatsApp (atualiza a "última sessão
+		// ativa"). Sem enviar presença available, o WhatsApp trata o companion
+		// como inativo e agenda a remoção por inatividade ("Será desconectado
+		// hoje"), mesmo com o bridge conectado 24/7. No primeiro pareamento o
+		// pushname pode não ter chegado ainda (SendPresence -> ErrNoPushName);
+		// nesse caso o reenvio ocorre no evento PushNameSetting abaixo.
+		go s.keepPresenceActive(ctx)
+	case *events.PushNameSetting:
+		// O pushname chegou (às vezes depois do Connected): reenvia a presença,
+		// pois SendPresence falha enquanto o nome não está no store.
+		go s.keepPresenceActive(ctx)
 	case *events.LoggedOut:
 		s.setAuth(AuthSnapshot{State: "logged_out", Paired: false})
 		go s.notifyDisconnected("desconectada (o aparelho desvinculou este dispositivo)",
@@ -395,9 +712,13 @@ func (s *Session) handleEvent(rawEvt any) {
 			go s.handleIncomingEventResponse(evt) // RSVP de evento (decodifica + encaminha)
 		case evt.Message.GetReactionMessage() != nil || evt.Message.GetEncReactionMessage() != nil:
 			go s.handleIncomingReaction(evt) // reação (emoji) numa mensagem
+		case evt.Message.GetSecretEncryptedMessage() != nil:
+			go s.handleIncomingSecretEdit(evt) // edição criptografada (decifra + reflete)
+		case isRevokeMessage(evt.Message):
+			go s.handleIncomingRevoke(evt) // mensagem apagada p/ todos -> evento `deleted`
 		default:
 			s.storeMessageEvent(evt)
-			s.dispatchWebhook("message", summarizeMessage(evt))
+			s.dispatchWebhook("message", s.messagePayload(evt))
 			go s.chatwootPushIncoming(evt)
 			s.maybeMarkRead(ctx, evt)
 		}
@@ -452,9 +773,33 @@ func (s *Session) handleUnknownCall(ctx context.Context, evt *events.UnknownCall
 	if callID == "" {
 		return
 	}
-	if ac, ok := s.reg.get(callID); ok {
-		ac.cm.HandleVideoState(ctx, evt.Node)
+	ac, ok := s.reg.get(callID)
+	if !ok {
+		return
 	}
+	// O whatsmeow só emite CallTerminate/CallReject tipado quando o <call> tem UM
+	// filho só; quando a chamada é atendida/encerrada em outro device (ex.: o
+	// celular), o WhatsApp às vezes manda o <terminate>/<reject> junto com outros
+	// nós (relaylatency etc.), e isso cai aqui como UnknownCallEvent — antes era
+	// ignorado, então a chamada nunca encerrava (ringtone preso nos atendentes e
+	// vaga presa no limite de chamadas). Agora tratamos como terminal.
+	if nodeHasTerminalCall(evt.Node) {
+		s.log.Info("call encerrada em outro device (terminal via UnknownCallEvent)", "call_id", callID)
+		ac.cm.HandleCallTerminate(evt.Node) // → OnEnded → broker.endCall (avisa TODOS) + removeCall
+		return
+	}
+	ac.cm.HandleVideoState(ctx, evt.Node)
+}
+
+// nodeHasTerminalCall diz se um <call> traz um <terminate> ou <reject> entre os
+// filhos (a chamada saiu do estado tocando: atendida/recusada/encerrada alhures).
+func nodeHasTerminalCall(node *waBinary.Node) bool {
+	for _, c := range node.GetChildren() {
+		if c.Tag == "terminate" || c.Tag == "reject" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Session) connect(ctx context.Context) error {
@@ -569,15 +914,35 @@ func (s *Session) notifyDisconnected(reason, action string) {
 }
 
 func (s *Session) info() SessionInfo {
-	s.mu.Lock()
-	a := s.auth
-	rec := s.recording
-	s.mu.Unlock()
 	jid := ""
 	if id := s.client.Store.ID; id != nil {
 		jid = id.String()
 	}
-	return SessionInfo{ID: s.id, Name: s.name, JID: jid, State: a.State, Paired: a.Paired || jid != "", Recording: rec, QR: a.QR}
+	s.mu.Lock()
+	a := s.auth
+	rec := s.recording
+	if jid != "" {
+		s.lastJID = jid // enquanto conectado, memoriza o número atual
+	}
+	last := s.lastJID
+	extEnabled := s.SIPExtEnabled
+	extHost := s.SIPExtHost
+	extPort := s.SIPExtPort
+	extUser := s.SIPExtUser
+	extPass := s.SIPExtPass
+	extDest := s.SIPExtDest
+	extStatus := s.sipExtStatus
+	extErr := s.sipExtError
+	qr := a.QR
+	s.mu.Unlock()
+	return SessionInfo{
+		ID: s.id, Name: s.name, JID: jid, LastJID: last, State: a.State,
+		Paired: a.Paired || jid != "", Recording: rec, QR: qr,
+		SIPUser: s.SIPUser, SIPPass: s.SIPPass, SIPURL: s.SIPURL,
+		SIPExtEnabled: extEnabled, SIPExtHost: extHost, SIPExtPort: extPort,
+		SIPExtUser: extUser, SIPExtPass: extPass, SIPExtDest: extDest,
+		SIPExtStatus: extStatus, SIPExtError: extErr,
+	}
 }
 
 func (s *Session) setBridge(callID string, b *Bridge, oc media.Codec) {
@@ -614,6 +979,9 @@ func (s *Session) removeCall(callID string) {
 	}
 	if ac.browserOpus != nil {
 		ac.browserOpus.Close()
+	}
+	if ac.rtpBridge != nil {
+		ac.rtpBridge.Close()
 	}
 }
 
@@ -661,6 +1029,15 @@ func (s *Session) teardownAllCalls() {
 		if ac.browserOpus != nil {
 			ac.browserOpus.Close()
 		}
+	}
+}
+
+// wsCallEvent envia um evento de ciclo de vida ao consumidor da ponte WebSocket
+// da chamada (só surte efeito se ele abriu o socket com ?events=1). No-op quando
+// não há ponte WS ativa naquela chamada.
+func (s *Session) wsCallEvent(callID string, ev map[string]any) {
+	if ac, ok := s.reg.get(callID); ok && ac.wsBridge != nil {
+		ac.wsBridge.SendEvent(ev)
 	}
 }
 
@@ -714,5 +1091,76 @@ func mapStatus(state core.CallState) CallStatus {
 		return StatusStarting
 	default:
 		return StatusRinging
+	}
+}
+
+// sipStartCall dispara uma chamada WhatsApp de saída a partir de um INVITE SIP.
+func (s *Session) sipStartCall(ctx context.Context, phone string, isVideo bool) (string, error) {
+	phone = strings.TrimSpace(phone)
+	phone = strings.TrimPrefix(phone, "+")
+	var cleaned strings.Builder
+	for _, c := range phone {
+		if c >= '0' && c <= '9' {
+			cleaned.WriteRune(c)
+		}
+	}
+	peer := types.NewJID(cleaned.String(), types.DefaultUserServer)
+	// chamada originada por SIP: grava conforme o modo de gravação da sessão.
+	return s.startOutgoing(ctx, peer, isVideo, false)
+}
+
+// sipExtConfig é um snapshot da configuração do modelo 2 (registro em PBX externo).
+type sipExtConfig struct {
+	Enabled bool
+	Host    string
+	Port    int
+	User    string
+	Pass    string
+	Dest    string
+}
+
+func (s *Session) sipExtSnapshot() sipExtConfig {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return sipExtConfig{
+		Enabled: s.SIPExtEnabled, Host: s.SIPExtHost, Port: s.SIPExtPort,
+		User: s.SIPExtUser, Pass: s.SIPExtPass, Dest: s.SIPExtDest,
+	}
+}
+
+func (s *Session) setSIPExt(c sipExtConfig) {
+	s.mu.Lock()
+	s.SIPExtEnabled = c.Enabled
+	s.SIPExtHost = c.Host
+	s.SIPExtPort = c.Port
+	s.SIPExtUser = c.User
+	s.SIPExtPass = c.Pass
+	s.SIPExtDest = c.Dest
+	s.mu.Unlock()
+}
+
+func (s *Session) setSIPExtStatus(state, errMsg string) {
+	s.mu.Lock()
+	s.sipExtStatus = state
+	s.sipExtError = errMsg
+	s.mu.Unlock()
+}
+
+func (s *Session) terminateCallByID(callID string) {
+	ac, ok := s.reg.get(callID)
+	if !ok {
+		return
+	}
+	_ = ac.cm.EndCall(context.Background(), core.EndCallReasonUserEnded)
+}
+
+func (s *Session) setRTPBridge(callID string, b *SIPRTPBridge) {
+	oldB, found := s.reg.setRTPBridge(callID, b)
+	if !found {
+		b.Close()
+		return
+	}
+	if oldB != nil {
+		oldB.Close()
 	}
 }

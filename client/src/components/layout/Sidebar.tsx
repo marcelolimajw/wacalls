@@ -7,6 +7,8 @@ import { ConfirmDialog } from "@/components/shared/ConfirmDialog";
 import { setActiveSession, useSessions } from "@/stores/sessions";
 import { createSession, deleteSession } from "@/services/sessions";
 import { EXTENSION_DOWNLOAD_URL } from "@/lib/passkey";
+import { phoneFromJid } from "@/utils/format";
+import { useVersion } from "@/hooks/useVersion";
 import type { SessionInfo, SessionState } from "@/types/session";
 
 const dotClass: Record<SessionState, string> = {
@@ -23,6 +25,7 @@ export const Sidebar = ({ onNavigate }: { onNavigate?: () => void }) => {
   const activeId = useSessions((s) => s.activeId);
   const [creating, setCreating] = useState(false);
   const [toDelete, setToDelete] = useState<SessionInfo | null>(null);
+  const { label: version, commit } = useVersion();
 
   const onNew = async () => {
     setCreating(true);
@@ -58,10 +61,15 @@ export const Sidebar = ({ onNavigate }: { onNavigate?: () => void }) => {
 
   return (
     <div className="flex h-full flex-col gap-1 p-3">
-      <div className="flex items-center px-2 pb-3 pt-1">
+      <div className="flex items-center gap-2 px-2 pb-3 pt-1">
         <span className="inline-flex dark:rounded-lg dark:bg-white dark:px-2 dark:py-1.5">
           <img src="/logoCalls.png" alt="AstraCalls" className="h-7 w-auto select-none" draggable={false} />
         </span>
+        {version && (
+          <span className="font-mono text-[0.6rem] leading-none text-muted-foreground" title={commit ? `commit ${commit}` : "Versão rodando"}>
+            {version}
+          </span>
+        )}
       </div>
       <Button className="w-full" onClick={onNew} disabled={creating}>
         {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
@@ -90,7 +98,11 @@ export const Sidebar = ({ onNavigate }: { onNavigate?: () => void }) => {
             <span className={cn("h-2.5 w-2.5 shrink-0 rounded-full ring-2 ring-card", dotClass[s.state])} />
             <div className="min-w-0 flex-1">
               <p className="truncate font-medium">{s.name}</p>
-              {s.jid && <p className="truncate text-xs text-muted-foreground">{s.jid.split("@")[0]}</p>}
+              {phoneFromJid(s.jid) ? (
+                <p className="truncate text-xs text-muted-foreground">{phoneFromJid(s.jid)}</p>
+              ) : phoneFromJid(s.lastJid) ? (
+                <p className="truncate text-xs text-muted-foreground">{phoneFromJid(s.lastJid)}</p>
+              ) : null}
             </div>
             <button
               onClick={(e) => {

@@ -53,6 +53,10 @@ type CallManager struct {
 	audioBaseTs        uint32
 	audioPlayedSamples uint64
 
+	recvDiagN     uint64 // diagnóstico: nº de pacotes de áudio do peer recebidos/decodificados do relay
+	rtpRecvN      uint64 // diagnóstico: nº de pacotes RTP crus recebidos do relay (qualquer payload type)
+	unprotectErrN uint64 // diagnóstico: nº de falhas de SRTP unprotect no áudio do peer
+
 	OnStateChange func(*CallInfo)
 	OnIncoming    func(*CallInfo)
 	OnEnded       func(*CallInfo)
@@ -78,6 +82,7 @@ func NewCallManager(sock core.VoipSocket, log *slog.Logger) *CallManager {
 	m.relay = relay
 	m.video = callvideo.New(log, relay)
 	m.video.OnFrame = func(au []byte) {
+		m.notePeerVideoActive()
 		if m.OnPeerVideo != nil {
 			m.OnPeerVideo(au)
 		}
@@ -242,7 +247,13 @@ func (m *CallManager) RejectCall(ctx context.Context, callID string, reason core
 		return &CallError{"no call with id " + callID}
 	}
 	_ = call.ApplyTransition(Transition{Type: TransitionLocalRejected, Reason: reason})
-	node := signaling.BuildRejectStanza(wanode.MustJID(call.PeerJid), call.CallID, wanode.MustJID(call.CallCreator))
+	peer := wanode.MustJID(call.PeerJid)
+	// from=ownID no perfil do peer: LID p/ peer @lid, PN p/ peer @s.whatsapp.net.
+	own := m.sock.OwnLID()
+	if peer.Server == types.DefaultUserServer {
+		own = m.sock.OwnPN()
+	}
+	node := signaling.BuildRejectStanza(peer, call.CallID, wanode.MustJID(call.CallCreator), own)
 	m.emitState()
 	m.mu.Unlock()
 

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +20,11 @@ func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/config", s.handleConfig)
+	// Credencial de widget para quem tem a chave-mestra (não entram em widgetAllowed,
+	// então SÓ a chave-mestra acessa). widget-key = estática por instância; widget-tokens
+	// = token efêmero escopado por conta (recomendado).
+	mux.HandleFunc("GET /api/widget-key", s.handleWidgetKey)
+	mux.HandleFunc("POST /api/widget-tokens", s.handleWidgetToken)
 	mux.HandleFunc("GET /api/sessions", s.handleSessionList)
 	mux.HandleFunc("POST /api/sessions", s.handleSessionCreate)
 	mux.HandleFunc("GET /api/sessions/{sid}/calls", s.handleSessionCalls)
@@ -28,6 +35,14 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/sessions/{sid}/pair-passkey", s.handlePairPasskey)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls", s.handleStartCall)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/fake", s.handleFakeCall)
+
+	// Gateway SIP (modelo Wavoip): status global e credenciais por sessão.
+	mux.HandleFunc("GET /api/sip/status", s.handleSIPStatus)
+	mux.HandleFunc("GET /api/sessions/{sid}/sip", s.handleSIPConfig)
+	mux.HandleFunc("POST /api/sessions/{sid}/sip", s.handleSIPConfig)
+	mux.HandleFunc("GET /api/sessions/{sid}/sip-ext", s.handleSIPExtConfig)
+	mux.HandleFunc("POST /api/sessions/{sid}/sip-ext", s.handleSIPExtConfig)
+
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/webrtc", s.handleWebRTC)
 	// Rota WebSocket de mídia — funciona atrás de proxy reverso HTTP (Cloudflare etc.)
 	// O browser envia/recebe PCM Int16 LE 16 kHz via WSS/443 em vez de WebRTC/UDP.
@@ -43,10 +58,22 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /api/sessions/{sid}/history", s.handleHistory)
 
 	// Mensageria (whatsmeow)
+	mux.HandleFunc("GET /api/sessions/{sid}/messages/new-message-id", s.handleNewMessageID)
 	mux.HandleFunc("POST /api/sessions/{sid}/messages/text", s.handleSendText)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/disappearing", s.handleSendDisappearing)
 	mux.HandleFunc("POST /api/sessions/{sid}/messages/image", s.handleSendImage)
 	mux.HandleFunc("POST /api/sessions/{sid}/messages/audio", s.handleSendAudio)
 	mux.HandleFunc("POST /api/sessions/{sid}/messages/video", s.handleSendVideo)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/ptv", s.handleSendPtv)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/forward", s.handleForward)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/buttons", s.handleSendButtons)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/list", s.handleSendList)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/interactive", s.handleSendInteractive)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/carousel", s.handleSendCarousel)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/form", s.handleSendForm)
+	mux.HandleFunc("POST /api/sessions/{sid}/schedule", s.handleSchedule)
+	mux.HandleFunc("GET /api/sessions/{sid}/schedule", s.handleListScheduled)
+	mux.HandleFunc("DELETE /api/sessions/{sid}/schedule/{id}", s.handleCancelScheduled)
 	mux.HandleFunc("POST /api/sessions/{sid}/messages/document", s.handleSendDocument)
 	mux.HandleFunc("POST /api/sessions/{sid}/messages/sticker", s.handleSendSticker)
 	mux.HandleFunc("POST /api/sessions/{sid}/messages/location", s.handleSendLocation)
@@ -61,6 +88,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("DELETE /api/sessions/{sid}/messages", s.handleDeleteMessage)
 	mux.HandleFunc("POST /api/sessions/{sid}/messages/seen", s.handleMarkSeen)
 	mux.HandleFunc("POST /api/sessions/{sid}/messages/typing", s.handleTyping)
+	// Baixar os bytes de uma mídia RECEBIDA (imagem/áudio/vídeo/documento/sticker)
+	mux.HandleFunc("GET /api/sessions/{sid}/messages/{id}/media", s.handleGetMedia)
 
 	// Contatos (whatsmeow)
 	mux.HandleFunc("GET /api/sessions/{sid}/contacts/check", s.handleCheckNumber)
@@ -135,6 +164,7 @@ func (s *server) routes() http.Handler {
 	// Histórico de conversas/mensagens
 	mux.HandleFunc("GET /api/sessions/{sid}/chats", s.handleListChats)
 	mux.HandleFunc("GET /api/sessions/{sid}/chats/{chatId}/messages", s.handleChatMessages)
+	mux.HandleFunc("GET /api/sessions/{sid}/messages/search", s.handleSearchMessages)
 	mux.HandleFunc("GET /api/sessions/{sid}/messages", s.handleQueryMessages)
 
 	// Webhook por sessão (recebimento -> Chatwoot etc.)
@@ -147,6 +177,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /api/sessions/{sid}/chatwoot", s.handleGetChatwoot)
 	mux.HandleFunc("DELETE /api/sessions/{sid}/chatwoot", s.handleDeleteChatwoot)
 	mux.HandleFunc("POST /api/sessions/{sid}/chatwoot/webhook", s.handleChatwootWebhook)
+	mux.HandleFunc("POST /api/sessions/{sid}/chatwoot/import-history", s.handleImportHistoryNow)
 	mux.HandleFunc("GET /api/chatwoot/resolve", s.handleChatwootResolve)
 	// Abrir sob demanda uma conversa de grupo/canal no Chatwoot
 	mux.HandleFunc("POST /api/sessions/{sid}/chatwoot/groups/{gid}/open", s.handleChatwootOpenGroup)
@@ -161,6 +192,12 @@ func (s *server) routes() http.Handler {
 	// Votar numa enquete recebida
 	mux.HandleFunc("POST /api/sessions/{sid}/messages/poll-vote", s.handlePollVote)
 	// Responder (RSVP) um evento recebido
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/event", s.handleSendEvent)
+	// Disparo (blast) com pacing anti-ban.
+	mux.HandleFunc("POST /api/sessions/{sid}/blast", s.handleBlast)
+	mux.HandleFunc("GET /api/sessions/{sid}/blasts", s.handleBlastList)
+	mux.HandleFunc("GET /api/sessions/{sid}/blasts/{id}", s.handleBlastGet)
+	mux.HandleFunc("POST /api/sessions/{sid}/blasts/{id}/cancel", s.handleBlastCancel)
 	mux.HandleFunc("POST /api/sessions/{sid}/messages/event-response", s.handleEventResponse)
 	// Disparo em massa de ligações com áudio pré-gravado
 	mux.HandleFunc("POST /api/sessions/{sid}/broadcast", s.handleBroadcast)
@@ -169,11 +206,27 @@ func (s *server) routes() http.Handler {
 	// não-enumerável e atua como capability.
 	mux.HandleFunc("GET /recordings/{id}", s.handleRecording)
 
+	// Formulários (webview) — rotas PÚBLICAS (fora de /api/): o celular do
+	// cliente abre a webview sem API key; o token assinado é a capability.
+	mux.HandleFunc("GET /forms/{token}", s.handleFormPage)
+	mux.HandleFunc("POST /forms/{token}/submit", s.handleFormSubmit)
+
+	// Observabilidade (aditivo, sem auth — fora de /api/): probes + métricas.
+	mux.HandleFunc("GET /livez", s.handleLivez)
+	mux.HandleFunc("GET /readyz", s.handleLivez)
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
+
 	mux.HandleFunc("GET /api/events", s.handleEvents)
+
+	// Confiabilidade de entrega do webhook de sessão (circuit breaker + DLQ).
+	mux.HandleFunc("GET /api/sessions/{sid}/webhooks/status", s.handleWebhookStatus)
+	mux.HandleFunc("GET /api/sessions/{sid}/webhooks/dlq", s.handleWebhookDLQ)
+	mux.HandleFunc("POST /api/sessions/{sid}/webhooks/dlq/{id}/replay", s.handleWebhookDLQReplay)
+	mux.HandleFunc("POST /api/sessions/{sid}/webhooks/reenable", s.handleWebhookReenable)
 
 	if s.staticDir != "" {
 		if _, err := os.Stat(s.staticDir); err == nil {
-			mux.Handle("/", http.FileServer(http.Dir(s.staticDir)))
+			mux.Handle("/", s.staticFileHandler())
 		}
 	}
 	var handler http.Handler = mux
@@ -215,11 +268,28 @@ func withAuth(h http.Handler, key, widgetKey string) http.Handler {
 			if got == "" {
 				got = r.URL.Query().Get("apiKey")
 			}
-			ok := got == key || (widgetKey != "" && got == widgetKey && widgetAllowed(r))
-			if !ok {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			if got == key {
+				h.ServeHTTP(w, r) // chave-mestra: libera tudo
 				return
 			}
+			// Superfície de widget: chave estática (por instância) OU token efêmero (por conta).
+			if widgetAllowed(r) {
+				if widgetKey != "" && got == widgetKey {
+					h.ServeHTTP(w, r)
+					return
+				}
+				if claims, ok := parseWidgetToken(got); ok {
+					// escopo de conta no SSE: um token só recebe eventos da sua própria conta.
+					if p == "/api/events" && !widgetTokenAccountMatches(r, claims) {
+						writeJSON(w, http.StatusForbidden, map[string]string{"error": "account_scope_mismatch"})
+						return
+					}
+					h.ServeHTTP(w, r)
+					return
+				}
+			}
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
 		}
 		h.ServeHTTP(w, r)
 	})
@@ -242,10 +312,56 @@ func widgetAllowed(r *http.Request) bool {
 	return false
 }
 
+// staticFileHandler serve o painel estático.
+//
+//   - index.html e widget.js revalidam (Cache-Control: no-cache) para o agente
+//     sempre pegar a última versão — um index.html velho apontaria pra um bundle
+//     antigo (sem o fallback de transporte da chamada), causando "chamada muda"
+//     após deploy. Os bundles com hash (/assets/index-<hash>.js) são imutáveis e
+//     seguem em cache normal.
+//   - Se WACALLS_DEFAULT_TRANSPORT estiver setado (ex.: "websocket"), injeta o
+//     valor no index.html (window.__WACALLS_DEFAULT_TRANSPORT). O painel então usa
+//     esse transporte por padrão, sem o agente precisar de ?transport=ws — útil
+//     em redes/servidores onde o WebRTC (UDP) não fecha e o WS é o caminho
+//     confiável. ?transport= e localStorage continuam tendo prioridade.
+func (s *server) staticFileHandler() http.Handler {
+	fs := http.FileServer(http.Dir(s.staticDir))
+	defaultTransport := strings.TrimSpace(os.Getenv("WACALLS_DEFAULT_TRANSPORT"))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/", "/index.html":
+			w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+			if defaultTransport != "" {
+				if b, err := os.ReadFile(filepath.Join(s.staticDir, "index.html")); err == nil {
+					inject := "<script>window.__WACALLS_DEFAULT_TRANSPORT=" + strconv.Quote(defaultTransport) + ";</script>"
+					html := strings.Replace(string(b), "</head>", inject+"</head>", 1)
+					w.Header().Set("Content-Type", "text/html; charset=utf-8")
+					_, _ = w.Write([]byte(html))
+					return
+				}
+			}
+		case "/widget.js":
+			w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+		}
+		fs.ServeHTTP(w, r)
+	})
+}
+
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// accountFromClientID extrai o número da conta do padrão "astrachat_accN" usado pela
+// integração do Chatwoot (ex.: "astrachat_acc4" -> 4). Devolve 0 se não casar, para
+// o chamador manter o comportamento de escopo admin.
+func accountFromClientID(cid string) int {
+	const prefix = "astrachat_acc"
+	if !strings.HasPrefix(cid, prefix) {
+		return 0
+	}
+	return asInt(strings.TrimPrefix(cid, prefix))
 }
 
 func clientID(r *http.Request) string {
@@ -267,12 +383,36 @@ func (s *server) sessionByID(w http.ResponseWriter, sid string) *Session {
 func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// accountId (opcional) escopa os eventos de chamada por conta do Chatwoot: o
 	// widget do Chatwoot passa a conta dele; o painel admin não passa e recebe tudo.
-	s.broker.serveSSE(w, r, clientID(r), asInt(r.URL.Query().Get("accountId")))
+	acc := asInt(r.URL.Query().Get("accountId"))
+	cid := clientID(r)
+	// Rede de segurança: se a integração conectar SEM accountId, o escopo cairia em
+	// 0 (=painel admin) e essa conexão passaria a receber chamadas de TODAS as contas
+	// — misturando empresas (chamada tocando/contato criado na conta errada). Quando o
+	// clientId vem no padrão "astrachat_accN", derivamos a conta do próprio N para não
+	// depender da integração lembrar de mandar o parâmetro.
+	if acc == 0 {
+		if derived := accountFromClientID(cid); derived != 0 {
+			acc = derived
+		}
+	}
+	// diagnóstico: quem conectou no SSE e com qual conta (o widget deve passar a
+	// conta do Chatwoot; o painel, nenhuma). Ajuda a ver se a chamada não "entra"
+	// no Chatwoot por o widget não estar conectado ou estar em outra conta.
+	s.log.Info("sse connect", "clientId", cid, "accountId", acc, "origin", r.Header.Get("Origin"))
+	s.broker.serveSSE(w, r, cid, acc)
+	s.log.Info("sse disconnect", "clientId", cid, "accountId", acc)
 }
 
 func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"maxCallsPerSession": s.sessions.maxCalls,
+		// Transporte de mídia padrão da chamada (ex.: "websocket") — o widget do
+		// Chatwoot lê isso p/ usar WS por padrão onde o WebRTC (UDP) não fecha.
+		"defaultTransport": strings.TrimSpace(os.Getenv("WACALLS_DEFAULT_TRANSPORT")),
+		// Build rodando — o painel mostra `version` (canal: develop/vX.Y.Z) ao lado da
+		// logo e `commit` (SHA) no tooltip.
+		"version": version,
+		"commit":  commit,
 	})
 }
 
@@ -674,11 +814,23 @@ func (s *server) doAccept(sess *Session, w http.ResponseWriter, r *http.Request)
 
 func (s *server) doReject(sess *Session, w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if ac, ok := sess.reg.get(id); ok {
-		_ = ac.cm.RejectCall(r.Context(), id, core.EndCallReasonDeclined)
+	ac, ok := sess.reg.get(id)
+	if !ok {
+		// callId desconhecido: NÃO responde 200 (antes respondia, então o cliente
+		// não distinguia "recusou" de "id errado/chamada já encerrada"). 404 deixa
+		// claro que a recusa não foi aplicada — o id certo é o mesmo do evento
+		// `incoming`/`call-list` (a chave da chamada).
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call", "status": "not_applied"})
+		return
 	}
+	// RejectCall envia o <reject> ao WhatsApp (encerra de fato a chamada de entrada).
+	err := ac.cm.RejectCall(r.Context(), id, core.EndCallReasonDeclined)
 	sess.removeCall(id)
 	s.broker.endCall(id, string(core.EndCallReasonDeclined))
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "status": "not_applied"})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 

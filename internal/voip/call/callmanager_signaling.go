@@ -2,6 +2,7 @@ package call
 
 import (
 	"context"
+	"strings"
 	"wacalls/internal/voip/core"
 	"wacalls/internal/voip/media"
 	"wacalls/internal/voip/signaling"
@@ -11,7 +12,10 @@ import (
 	"go.mau.fi/whatsmeow/types"
 )
 
-func (m *CallManager) HandleCallOffer(ctx context.Context, node *waBinary.Node, peerJid types.JID) {
+// callerPn é o telefone real (PN) do chamador quando o offer o traz (atributo
+// caller_pn, exposto pelo whatsmeow em CallOffer.CallCreatorAlt). Vem vazio quando
+// só há LID. Guardamos em CallInfo.CallerPn p/ não depender do mapa local de LID.
+func (m *CallManager) HandleCallOffer(ctx context.Context, node *waBinary.Node, peerJid types.JID, callerPn string) {
 	info := signaling.ExtractNodeInfo(node)
 	if info == nil {
 		return
@@ -38,7 +42,7 @@ func (m *CallManager) HandleCallOffer(ctx context.Context, node *waBinary.Node, 
 	}
 
 	m.mu.Lock()
-	call := NewIncomingCall(callID, peerJid.String(), creator, "", mediaType)
+	call := NewIncomingCall(callID, peerJid.String(), creator, callerPn, mediaType)
 	if callKey != nil {
 		call.EncryptionKey = callKey
 	}
@@ -293,22 +297,38 @@ func (m *CallManager) HandleCallTerminate(node *waBinary.Node) {
 		m.mu.Unlock()
 		return
 	}
-	// Depois de um accept, só o device que atendeu pode encerrar. Um sibling que
-	// continuou tocando eventualmente dá timeout e manda o próprio reject/terminate,
-	// que não pode derrubar a chamada já ativa.
 	sender := wanode.AttrString(node.Attrs, "from")
-	if m.acceptedByJid != "" && sender != "" && sender != m.acceptedByJid && !call.IsEnded() {
-		m.mu.Unlock()
-		m.log.Info("terminate from non-answering device ignored",
-			"call_id", call.CallID, "from", sender, "accepted_by", m.acceptedByJid)
-		return
-	}
 	info := signaling.ExtractNodeInfo(node)
 	reason := core.EndCallReasonUserEnded
 	if info != nil {
 		if r := wanode.AttrString(info.InnerNode.Attrs, "reason"); r != "" {
 			reason = core.EndCallReason(r)
 		}
+	}
+
+	// Um device secundário hosted.lid vinculado à nossa própria conta pode responder
+	// ao offer de entrada com "uncallable" antes de o operador atender. O evento
+	// tipado CallReject do whatsmeow não preserva o atributo externo platform=capi,
+	// então usamos a identidade hosted.lid que permanece disponível. Esse reject
+	// descreve somente a incapacidade do sibling; o chamador original segue tocando.
+	if call.Direction == core.CallDirectionIncoming && call.CanAccept() &&
+		reason == core.EndCallReasonUncallable && info != nil &&
+		strings.HasSuffix(strings.ToLower(sender), "@hosted.lid") &&
+		sender != call.CallCreator && sender != call.PeerJid {
+		m.mu.Unlock()
+		m.log.Info("uncallable from secondary hosted device ignored",
+			"call_id", call.CallID, "from", sender, "call_creator", call.CallCreator)
+		return
+	}
+
+	// Depois de um accept, só o device que atendeu pode encerrar. Um sibling que
+	// continuou tocando eventualmente dá timeout e manda o próprio reject/terminate,
+	// que não pode derrubar a chamada já ativa.
+	if m.acceptedByJid != "" && sender != "" && sender != m.acceptedByJid && !call.IsEnded() {
+		m.mu.Unlock()
+		m.log.Info("terminate from non-answering device ignored",
+			"call_id", call.CallID, "from", sender, "accepted_by", m.acceptedByJid)
+		return
 	}
 	m.log.Info("call terminated by peer", "call_id", call.CallID, "reason", string(reason))
 	_ = call.ApplyTransition(Transition{Type: TransitionTerminated, Reason: reason})

@@ -21,6 +21,15 @@ type SessionManager struct {
 	log      *slog.Logger
 	maxCalls int
 
+	// sipInbound, se definido, é chamado quando o WhatsApp recebe uma chamada,
+	// para tocar num softphone/PBX SIP registrado (gateway SIP).
+	sipInbound func(sess *Session, callID, peerNumber string)
+
+	// sipExtApply/sipExtRemove (modelo 2) sincronizam o registro da sessão num PBX
+	// externo: apply (re)inicia conforme a config; remove para ao deletar a sessão.
+	sipExtApply  func(sess *Session)
+	sipExtRemove func(sessionID string)
+
 	mu       sync.RWMutex
 	sessions map[string]*Session
 	order    []string
@@ -176,9 +185,26 @@ func (m *SessionManager) Restore(ctx context.Context) error {
 		}
 		client := whatsmeow.NewClient(device, m.waLogger)
 		s := newSession(m, row.ID, row.Name, client)
+		if row.LastJID != "" {
+			s.lastJID = row.LastJID
+		} else {
+			s.lastJID = row.JID
+		}
 		s.waContainer = container
 		s.waDB = db
-		s.setWebhook(row.Webhook)
+		// backfill de credenciais SIP para sessões criadas antes do recurso.
+		if row.SIPUser == "" {
+			row.SIPUser = "wa_" + genSIPCredential(4)
+			row.SIPPass = genSIPCredential(12)
+			_ = m.store.setSIP(ctx, row.ID, row.SIPUser, row.SIPPass)
+		}
+		s.SIPUser = row.SIPUser
+		s.SIPPass = row.SIPPass
+		s.setSIPExt(sipExtConfig{
+			Enabled: row.SIPExtEnabled, Host: row.SIPExtHost, Port: row.SIPExtPort,
+			User: row.SIPExtUser, Pass: row.SIPExtPass, Dest: row.SIPExtDest,
+		})
+		s.setWebhook(row.Webhook, row.WebhookSecret, splitEvents(row.WebhookEvents))
 		s.setRecording(row.Recording)
 		s.setProxy(row.Proxy)
 		if row.Chatwoot != "" {
@@ -188,6 +214,9 @@ func (m *SessionManager) Restore(ctx context.Context) error {
 			}
 		}
 		m.register(s)
+		if m.sipExtApply != nil && s.SIPExtEnabled {
+			m.sipExtApply(s) // modelo 2: retoma o registro no PBX externo
+		}
 		if err := s.connect(ctx); err != nil {
 			m.log.Error("session connect failed", "session", row.ID, "err", err)
 		}
@@ -199,7 +228,8 @@ func (m *SessionManager) Restore(ctx context.Context) error {
 
 func (m *SessionManager) Create(name string) (string, error) {
 	id := newSessionID()
-	if err := m.store.insert(m.appCtx, id, name); err != nil {
+	sipUser, sipPass, err := m.store.insert(m.appCtx, id, name)
+	if err != nil {
 		return "", err
 	}
 	container, db, err := m.db.openSessionContainer(m.appCtx, id)
@@ -213,6 +243,8 @@ func (m *SessionManager) Create(name string) (string, error) {
 	s := newSession(m, id, name, client)
 	s.waContainer = container
 	s.waDB = db
+	s.SIPUser = sipUser
+	s.SIPPass = sipPass
 	m.register(s)
 	m.broker.emitSessionList(m.infos())
 	if err := s.startPairing(m.appCtx); err != nil {
@@ -235,6 +267,9 @@ func (m *SessionManager) Delete(ctx context.Context, id string) error {
 	}
 	s.client.Disconnect()
 	s.teardownAllCalls()
+	if m.sipExtRemove != nil {
+		m.sipExtRemove(id) // modelo 2: para o registro no PBX externo
+	}
 	// o store da sessão é um banco inteiro só dela: fecha a conexão e derruba.
 	if s.waDB != nil {
 		_ = s.waDB.Close()

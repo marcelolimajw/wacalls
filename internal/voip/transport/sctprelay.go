@@ -3,6 +3,7 @@ package transport
 import (
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"regexp"
 	"sync"
 	"time"
@@ -15,6 +16,12 @@ import (
 const (
 	relayConnectionTimeout = 20 * time.Second
 	relayKeepaliveInterval = 1100 * time.Millisecond
+	// relayConsentBasePeriod é o período base para renovar o consent freshness
+	// (RFC 7675) no par ativo. O WhatsApp derruba a mídia por volta dos ~20s se não
+	// receber Binding requests periódicos; o WhatsAppPing sozinho (keepalive) não
+	// renova esse consent. A RFC manda: default 5s, cada intervalo randomizado em
+	// 0.8–1.2x (4–6s, nunca < 4s) para evitar sincronização, e expiry de 30s.
+	relayConsentBasePeriod = 5 * time.Second
 
 	// maxDialRelays limita quantos relays são discados por chamada (corta
 	// goroutines/conexões desnecessárias quando o WhatsApp anuncia muitos relays).
@@ -361,7 +368,9 @@ func (m *SctpRelayManager) startKeepalive(conn *relayConnection) {
 	m.sendRaw(conn, BuildWhatsAppPing())
 	ticker := time.NewTicker(relayKeepaliveInterval)
 	conn.keepalive = ticker
+	consent := time.NewTimer(consentInterval())
 	go func() {
+		defer consent.Stop()
 		for {
 			select {
 			case <-ticker.C:
@@ -369,12 +378,60 @@ func (m *SctpRelayManager) startKeepalive(conn *relayConnection) {
 					return
 				}
 				m.sendRaw(conn, BuildWhatsAppPing())
+			case <-consent.C:
+				if conn.state != relayStateOpen || conn.channel == nil {
+					return
+				}
+				m.sendConsentBinding(conn)
+				consent.Reset(consentInterval())
 			case <-conn.stopCh:
 				ticker.Stop()
 				return
 			}
 		}
 	}()
+}
+
+// consentInterval devolve o próximo intervalo entre checks de consent, randomizado
+// em 0.8–1.2x o período base (RFC 7675, seção 5.1). A randomização evita que
+// múltiplas conexões sincronizem os checks; o piso de 4s (0.8*5s) respeita o
+// "MUST NOT set the period between checks to less than 4 seconds".
+func consentInterval() time.Duration {
+	factor := 0.8 + rand.Float64()*0.4 // [0.8, 1.2)
+	return time.Duration(float64(relayConsentBasePeriod) * factor)
+}
+
+// sendConsentBinding reenvia o STUN Binding request autenticado (com as
+// subscriptions) no par ativo, renovando o consent freshness (RFC 7675). Sem
+// esse Binding periódico o WhatsApp expira o consent e encerra a mídia por volta
+// dos ~20s, mesmo com áudio fluindo nos dois sentidos. Reaproveita exatamente os
+// mesmos pacotes que sendStunRegistration já manda no setup.
+func (m *SctpRelayManager) sendConsentBinding(conn *relayConnection) {
+	info := conn.info
+	remoteUfrag := info.AuthToken
+	if remoteUfrag == "" {
+		remoteUfrag = info.Token
+	}
+	localUfrag := conn.localUfrag
+	if remoteUfrag == "" || localUfrag == "" {
+		return
+	}
+	ssrc := m.subscriptionSsrc
+	if ssrc == 0 {
+		ssrc = m.audioSsrc
+	}
+	if ssrc == 0 {
+		return
+	}
+	hmacKey := []byte(info.Key)
+	subs := BuildSenderSubscriptions(ssrc)
+
+	username := []byte(remoteUfrag + ":" + localUfrag)
+	m.sendRaw(conn, BuildBindingRequestWithSubs(username, hmacKey, subs, true, true))
+	if info.Token != "" && info.Token != remoteUfrag {
+		username2 := []byte(info.Token + ":" + localUfrag)
+		m.sendRaw(conn, BuildBindingRequestWithSubs(username2, hmacKey, subs, true, true))
+	}
 }
 
 func (m *SctpRelayManager) sendRaw(conn *relayConnection, data []byte) {

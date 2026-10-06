@@ -41,10 +41,23 @@ type SessionInfo struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
 	JID       string `json:"jid"`
+	LastJID   string `json:"lastJid"` // último número conectado (persiste após desconectar)
 	State     string `json:"state"`
 	Paired    bool   `json:"paired"`
 	Recording bool   `json:"recording"`
 	QR        string `json:"qr,omitempty"`
+	SIPUser   string `json:"sip_user"`
+	SIPPass   string `json:"sip_pass"`
+	SIPURL    string `json:"sip_url"`
+	// Modelo 2 (registro em PBX externo).
+	SIPExtEnabled bool   `json:"sip_ext_enabled"`
+	SIPExtHost    string `json:"sip_ext_host"`
+	SIPExtPort    int    `json:"sip_ext_port"`
+	SIPExtUser    string `json:"sip_ext_user"`
+	SIPExtPass    string `json:"sip_ext_pass"`
+	SIPExtDest    string `json:"sip_ext_dest"`
+	SIPExtStatus  string `json:"sip_ext_status"`
+	SIPExtError   string `json:"sip_ext_error"`
 }
 
 type subscriber struct {
@@ -326,6 +339,27 @@ func (b *Broker) emitVideoState(sessionID, id, kind string, peerVideo, localVide
 		"peerVideo": peerVideo, "localVideo": localVideo,
 		"upgradeIncoming": upgradeIncoming, "upgradeOutgoing": upgradeOutgoing,
 	})
+}
+
+// subscriberScope devolve, para diagnóstico, o account_id resolvido da sessão e a
+// contagem de assinantes: total, quantos receberão eventos escopados por conta
+// (escopo casa) e quantos são widgets de OUTRA conta (que serão filtrados). Serve
+// para explicar por que uma chamada recebida "toca no painel mas não no widget".
+func (b *Broker) subscriberScope(sessionID string) (acct, total, matched, widgetOtherAcct int) {
+	if b.AccountForSession != nil {
+		acct = b.AccountForSession(sessionID)
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for s := range b.subs {
+		total++
+		if s.accountID != 0 && s.accountID != acct {
+			widgetOtherAcct++
+			continue
+		}
+		matched++
+	}
+	return
 }
 
 func (b *Broker) emitIncomingClaimed(sessionID, id, owner string) {

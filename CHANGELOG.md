@@ -2,6 +2,340 @@
 
 Todas as mudanças relevantes do AstraCalls.
 
+## v1.1.0 — 2026-10-02
+
+Rodada grande de funcionalidades: **carrossel**, **formulário (webview)**, **mensagem
+que some após leitura**, **disparo em massa de ligações de VÍDEO**, **importar
+histórico sob demanda**, **áudio de chamada muito melhor (MLow 16k)** e a **versão do
+build no painel** — além de correções importantes em ligações e botões.
+
+### 🆕 Mensagens interativas & formulários
+
+- **Carrossel de cards:** `POST /messages/carousel` — vários cards com imagem, título,
+  texto e botões.
+- **Formulário dentro do WhatsApp (webview):** `POST /messages/form` — botão que abre
+  um formulário em tela cheia dentro do app (campos texto/email/tel/select etc.). As
+  respostas caem no Chatwoot como mensagem do cliente + webhook `form_response`. Rotas
+  públicas `GET/POST /forms/{token}` (token HMAC como capability, sem API key).
+- **Resposta de botão/lista/carrossel:** o **toque** do interlocutor agora vira a
+  **escolha dele** (texto) no webhook e no Chatwoot — antes caía como "unknown".
+
+### 🔇 Mensagem que some depois de lida
+
+- `POST /messages/disappearing` — texto que desaparece X segundos **após o destinatário
+  ler** (afterReadDuration), diferente do temporário normal. Bom para senha/código.
+
+### 📞 Ligações em massa de VÍDEO + áudio melhor
+
+- **Disparo de ligação de VÍDEO:** `POST /broadcast` com `video:true` — liga em vídeo e
+  **toca um arquivo gravado** na chamada (decodifica em H.264 e injeta). Preserva a
+  **proporção** (vertical fica vertical), **qualidade ajustável** (`video_max`,
+  `video_bitrate`, `video_fps`) e **pacing** para não congelar.
+- **Áudio da chamada muito melhor (MLow):** de 6kbps → **16kbps + complexity 9 + FEC**
+  (voz bem mais limpa) em chamadas de áudio. Em **videochamada**, o áudio fica enxuto
+  automaticamente para não roubar banda do vídeo (áudio e vídeo dividem o canal).
+  _Obs.: a qualidade de vídeo na chamada é limitada pela banda do relay (~50-60kbps) —
+  para vídeo nítido, use vídeo-mensagem._
+
+### 📥 Chatwoot — importar histórico sob demanda
+
+- `POST /sessions/{sid}/chatwoot/import-history` — importa o histórico do WhatsApp para o
+  Chatwoot **com a sessão já conectada** (antes só vinha no pareamento do dispositivo).
+
+### 🏷️ Painel
+
+- Mostra o **canal do build** (develop / vX.Y.Z) ao lado da logo; o commit aparece no
+  tooltip. Exposto também em `GET /api/config` (`version`/`commit`).
+
+### 🐞 Correções
+
+- **Ligação recebida não cria mais "contato lixo":** o telefone do chamador vai com o
+  **número real (E.164)** ou **vazio** — nunca o LID cru. Usa o `caller_pn` do offer
+  para identificar o chamador (menos "desconhecido").
+- **Ligação de saída que "não tocava":** o destino era resolvido por um LID stale/errado;
+  agora resolve pelo **IsOnWhatsApp** (LID correto).
+- **Botão em grupo não "marca geral":** em grupo, o botão de resposta vira um link
+  `wa.me` que abre o privado, em vez de postar para o grupo inteiro.
+
+## v1.0.2 — 2026-09-25
+
+Rodada de API de mensagens: **botões/listas interativas** que entregam de verdade,
+**agendamento**, **encaminhar**, **busca**, **webhook assinado**, envio idempotente
+e mais robustez no envio.
+
+### 🔘 Mensagens interativas (novo)
+
+- **Botões que renderizam no WhatsApp** (número não-oficial): `POST /messages/interactive`
+  (CTA — abrir URL, copiar código, ligar, resposta rápida), `POST /messages/buttons`
+  (botões de resposta, até 3) e `POST /messages/list` (menu de lista). Usa o formato
+  native flow com o stanza correto que faz o WhatsApp entregar/exibir. *A lista só
+  renderiza no aplicativo do celular — no WhatsApp Web ela pede "use o celular"
+  (limitação do Web).* Para botão com garantia total, a API oficial (coexistência)
+  segue sendo o caminho.
+
+### 💬 Envio & mensagens (novo)
+
+- **Envio idempotente:** `GET /messages/new-message-id` gera um id, e o envio aceita
+  um `id` do cliente (header `X-Message-ID` ou `?id=`) em **todos** os endpoints —
+  reenviar com o mesmo id **não duplica** a mensagem (ótimo para retry).
+- **Agendamento (`send_at`):** `POST /schedule` agenda texto/imagem para o futuro;
+  `GET /schedule` lista e `DELETE /schedule/{id}` cancela. Persiste (sobrevive a
+  restart) e um worker envia na hora marcada.
+- **Encaminhar:** `POST /messages/forward {to, messageId}` encaminha uma mensagem
+  do histórico (inclusive mídia), marcada como encaminhada.
+- **Busca:** `GET /messages/search?q=&chatId=` procura no histórico de mensagens.
+- **Nota de vídeo (PTV):** `POST /messages/ptv` envia o "balãozinho" de vídeo redondo.
+
+### 🔒 Webhook
+
+- **Assinatura HMAC-SHA256:** configure um `secret` no `POST /webhook` e cada
+  entrega leva o header `X-Webhook-Signature: sha256=…` para o consumidor verificar
+  a autenticidade. O `GET` não devolve o segredo em claro.
+- **Filtro de eventos:** `POST /webhook {events:[...]}` entrega só os tipos de
+  evento assinados (vazio = todos), reduzindo ruído.
+
+### 🛠️ Robustez de envio
+
+- **Correção do 9º dígito (LID) em TODOS os envios diretos.** Antes só o caminho do
+  Chatwoot resolvia o LID; agora os endpoints de envio da API também reenviam
+  corretamente quando o servidor retorna "no LID found" (comum no 9º dígito BR).
+
+## v1.0.1 — 2026-09-25
+
+Correção pontual no vídeo recebido.
+
+### 📹 Vídeo
+
+- **Câmera do cliente não fica mais preta no painel.** O vídeo do peer só era
+  exibido quando o WhatsApp mandava a sinalização `<video state=1>` — o que nem
+  sempre acontece (vídeo desde o início da chamada, ou sinal fora do caminho
+  tratado). Nesses casos o vídeo do cliente chegava e era decodificado, mas o
+  painel não o exibia (ficava preto), embora o operador aparecesse normalmente
+  para o cliente. Agora, assim que chegam **frames de vídeo reais** do peer, o
+  painel passa a exibir a câmera dele — sem depender apenas da sinalização.
+
+## v1.0.0 — 2026-09-25
+
+Primeira versão estável. 🎉 Rodada grande de confiabilidade de chamada (não cair
+aos ~20s, recusa que para o telefone, religar vídeo), **disparo em massa**,
+**entrega confiável de webhook**, **observabilidade**, **anti-SSRF** e transporte
+de chamada **auto/WebSocket** que conecta mesmo atrás de firewall.
+
+### ☎️ Chamadas — confiabilidade
+
+- **Consent freshness (RFC 7675).** A chamada WebRTC **não cai mais sozinha por
+  volta dos ~20s**: o keepalive do relay renova o consent com STUN Binding
+  periódico (período base 5s, randomizado 4–6s conforme a RFC). Antes o WhatsApp
+  derrubava a mídia mesmo com áudio fluindo.
+- **Recusa (`/reject`) para o telefone de quem ligou.** O `<reject>` passou a
+  levar `count="0"` **e** `from=ownID` (alinhado ao `RejectCall` do whatsmeow) —
+  antes o aparelho do chamador continuava tocando até o timeout.
+- **Chamada recebida não cai sozinha antes de atender.** Um dispositivo secundário
+  `@hosted.lid` da própria conta que responde `uncallable` não derruba mais a
+  chamada — os controles Atender/Recusar continuam disponíveis. (#27 / #28)
+- **Timeout de toque.** Chamada de entrada que nunca recebe o encerramento expira
+  sozinha, sem prender a vaga da sessão.
+
+### 📹 Vídeo
+
+- **Religar a câmera no meio da chamada funciona.** Desligar e ligar o vídeo de
+  novo agora envia `<video state=1>` (em vez de um novo pedido de upgrade), então
+  a câmera reativa no aparelho do cliente.
+
+### 📞 Transporte de chamada (áudio no navegador)
+
+- **Fallback automático WebRTC → WebSocket** (modo `auto`, padrão): se o WebRTC não
+  fecha (ex.: UDP bloqueado por firewall), cai para WebSocket automaticamente — a
+  chamada conecta **sem precisar abrir portas**.
+- **`WACALLS_DEFAULT_TRANSPORT`**: fixa o transporte por instância
+  (`websocket` | `webrtc` | `auto`).
+- **WebSocket no widget de chamada do Chatwoot** (áudio full-duplex, sem depender
+  de UDP).
+- **`no-cache` no `index.html`** do painel: o navegador sempre carrega a última
+  versão publicada.
+
+### 💬 Envio & mensagens
+
+- **Correção do 9º dígito BR / erro `no LID found`.** Resolve o JID canônico
+  (via `IsOnWhatsApp`), grava o mapeamento **PN↔LID** e reenvia pelo PN —
+  mensagens que falhavam/duplicavam passam a entregar corretamente.
+- **O webhook do Chatwoot não engole mais falha de envio:** responde **502**
+  quando o WhatsApp recusa (antes retornava 200 em qualquer caso).
+- **`POST /messages/event`** (envia mensagem de evento) e a flag
+  `astracall_rich_sent` para o Chatwoot **não reenviar** mensagem rica já enviada
+  pela API.
+- **`quotedMessageId` / `quotedParticipant`** expostos no evento de mensagem do
+  webhook (inclusive em grupos).
+
+### 📢 Disparo em massa (novo)
+
+- **`POST /blast`**: campanha de texto ou imagem com **pacing anti-ban** (worker
+  sequencial, delay + jitter aleatório entre envios, retry por destinatário e
+  cancelamento). Endpoints de status, listagem e cancelamento.
+
+### 🔁 Entrega confiável de webhook (novo)
+
+- **Retry com backoff**, **circuit breaker** por sessão, **DLQ** (dead-letter
+  queue) consultável e **replay** por endpoint. Payload e headers idênticos — nada
+  muda para quem consome (ex.: AstraChat).
+
+### 📊 Observabilidade (novo)
+
+- **`GET /livez`, `/readyz`, `/metrics`** (formato Prometheus, sem dependência
+  nova): número de sessões carregadas, itens em DLQ e uptime.
+
+### 🔒 Segurança
+
+- **Guarda anti-SSRF** no download de mídia por URL do usuário (bloqueia IPs
+  internos/privados; isenta o `data_url` do próprio Chatwoot).
+
+### 🐳 Infra / CI
+
+- Tag da imagem com prefixo **`v`** (`type=ref,event=tag`) e publicação de
+  **`:latest`** nas tags `v*`; build multi-arch (amd64 + arm64) nativo por
+  arquitetura.
+
+## v0.0.9 — 2026-09-09
+
+Correções de confiabilidade nas chamadas (recusa e encerramento) e imagem
+Docker **multi-arquitetura** (amd64 + arm64).
+
+### ☎️ Chamadas
+
+- **Recusa (`/reject`) confiável.** O endpoint agora responde **404** quando o
+  `callId` não existe / a chamada já encerrou, e **409** quando o WhatsApp recusa
+  a operação — em vez de responder **200 em qualquer caso**. O cliente passa a
+  distinguir "recusei de verdade" de "id errado". O `callId` é o mesmo dos eventos
+  `incoming`/`call-list`.
+- **Encerramento confiável quando a chamada é atendida ou encerrada em outro
+  aparelho** (ex.: o próprio celular). O WhatsApp às vezes envia o
+  `<terminate>`/`<reject>` junto com outros nós, o que caía como evento
+  "desconhecido" e era **ignorado** — a chamada nunca encerrava. Isso deixava o
+  **toque preso** nos atendentes e a **vaga da chamada presa**, esgotando o limite
+  e fazendo novas chamadas serem **recusadas automaticamente**. Agora é tratado
+  como encerramento: avisa **todos** os atendentes (`call-ended`) e **libera a
+  vaga**.
+
+### 🐳 Imagem & infraestrutura
+
+- **Imagem Docker multi-arquitetura: `linux/amd64` + `linux/arm64`.** Roda também
+  em servidores ARM (AWS Graviton, Ampere/Oracle Cloud, etc.), não só x86.
+- Build multi-arch automatizado por CI, com build **nativo por arquitetura** (sem
+  emulação).
+
+## v0.0.8 — 2026-09-02
+
+Chamadas por **SIP/PBX** (tronco e ramal, áudio bidirecional), correção de
+vazamento de chamadas entre contas no multi-conta, token de widget por conta
+para não expor a chave-mestra, notas de voz com waveform, download de mídia
+recebida e citações/menções no envio.
+
+### ☎️ Chamadas por SIP / PBX (novo)
+
+- **Gateway SIP** (servidor Go na porta 5060 UDP/TCP) integrando tronco/PBX ↔
+  WhatsApp por sessão, com **áudio bidirecional** (ponte RTP G.711 u-law 8kHz ↔
+  PCM 16kHz do WhatsApp) e autenticação **Digest MD5** no REGISTER.
+  - **Modelo 1 — o PBX registra no AstraCalls:** o painel mostra usuário/senha/
+    servidor por sessão; o cliente cria um tronco no Asterisk/FreePBX. SIP→WhatsApp
+    disca o número pelo WhatsApp (200 OK só quando a chamada conecta); WhatsApp→SIP
+    toca no PBX/softphone registrado.
+  - **Modelo 2 — o AstraCalls registra num PBX externo (UAC):** campos de host/
+    porta/usuário/senha e ramal de destino no painel, REGISTER + re-REGISTER
+    automático, desafio Digest e **status do registro** (Registrando/Registrado/
+    Falhou) na tela.
+- **Robustez:** RTP em faixa de portas fixa (funciona atrás do Docker Swarm/NAT);
+  tratamento de `Expires: 0` (desregistro) e **expiração de registro** — um PBX
+  que cai não deixa mais registro fantasma que derrubaria chamadas reais de entrada.
+
+### 💬 Chatwoot & multi-conta
+
+- **Correção de vazamento entre contas nos eventos.** Conexões de eventos (SSE)
+  abertas sem `accountId` não são mais tratadas como "admin" (que recebia chamadas
+  de TODAS as contas): a conta é derivada do `clientId` no padrão `astrachat_accN`
+  quando o parâmetro não vem. Fim de chamada tocando/contato criado na conta errada.
+- **Fim de contato com LID como número.** Contatos 1:1 vindos de `@lid` não são
+  mais criados com o LID cru no `phone_number`; quando o número real (PN) resolve
+  depois, o telefone é preenchido (backfill) no contato existente — encontrado
+  também pelo identifier `@lid` — em vez de duplicar.
+
+### 🔐 Integração & segurança
+
+- **Token de widget por conta.** `POST /api/widget-tokens` (com a chave-mestra)
+  devolve um token efêmero, escopado a uma conta (e opcionalmente inbox), que abre
+  só a superfície de widget (eventos/resolve/chamadas) e, no SSE, **só recebe
+  eventos da própria conta** (senão `403 account_scope_mismatch`). Evita pôr a
+  chave-mestra no navegador. `GET /api/widget-key` devolve a chave estática por
+  instância, ou **409 explícito** quando não configurada.
+
+### 🎙️ Mensagens & mídia
+
+- **Nota de voz (PTT) com duração e waveform.** O envio de áudio aceita `seconds`
+  e `waveform`; quando não vêm, o servidor estima a duração pela granule do
+  OGG/Opus e gera um waveform aproximado. Antes a nota chegava sem tempo e com
+  barra reta.
+- **Download de mídia recebida** (`GET /api/sessions/{sid}/messages/{id}/media`,
+  decifra imagem/áudio/vídeo/documento/sticker), **citação (`quotedMessageId`) e
+  menções** no envio (texto/imagem/vídeo/áudio/documento), novo evento de webhook
+  **`deleted`** quando o contato apaga uma mensagem para todos, `senderPhone`/
+  `chatPhone` (telefone real do `@lid`) no webhook, e marcação de tipo de conversa
+  (individual/grupo/canal/broadcast) em `/chats`.
+
+### 🖥️ Painel
+
+- Mostra o **número conectado** e o **último número** após desconectar (formato BR),
+  e remove o sufixo de device (`:N`) do número na lista de conexões.
+
+### 🛠️ Infra & dependências
+
+- whatsmeow atualizado (28-08-2026); build do codec MLow via **submódulo**
+  (não depende mais de clonar o GitHub em tempo de build); **logs de diagnóstico
+  de SIP/mídia opt-in** via `WACALLS_SIP_DEBUG` (desligados por padrão).
+
+## v0.0.7 — 2026-08-26
+
+Reflexo de mensagens editadas no Chatwoot, captura da origem de anúncios (Click
+to WhatsApp), transporte de áudio da chamada por WebSocket para integrações de
+voz/IA, e melhorias de estabilidade de conexão.
+
+### 💬 Chatwoot & Mensagens
+
+- **Mensagem editada pelo contato agora aparece.** Quando o cliente edita uma
+  mensagem no WhatsApp, o Chatwoot passa a mostrar um balão **"✏️ Editada:"** com
+  o texto novo, ligado à mensagem original. Cobre inclusive a edição
+  **criptografada** (`secretEncryptedMessage`), que antes chegava vazia. O webhook
+  ganhou os campos `edited` e `editedId`.
+- **Origem de anúncio (Click to WhatsApp).** Quando o contato chega por um anúncio
+  do Facebook/Instagram, a primeira mensagem traz um objeto `referral` no webhook
+  (click id `ctwaClid`, link, título, `ref`, source/medium) — o "UTM" do WhatsApp
+  — e a origem é registrada como nota na conversa do Chatwoot.
+- **Correção: documento chegando como `.bin` no Android.** PDFs e arquivos
+  enviados pelo Chatwoot chegavam sem extensão/mimetype correto e o celular do
+  cliente abria como `.bin`. Agora o tipo é resolvido pelo cabeçalho HTTP e pela
+  assinatura do arquivo.
+
+### 🔌 Estabilidade & Conexão
+
+- **Fim do "Será desconectado hoje".** A conta era marcada como inativa e agendada
+  para remoção mesmo com o bridge conectado 24/7. Agora enviamos presença
+  `available` (com espera pelo pushname real e reforço periódico), mantendo o
+  dispositivo ativo.
+- **Atualização do whatsmeow.** Endereçamento LID em conversas diretas, correção
+  de download de mídia e isolamento da fila de handlers por conexão (mais
+  estabilidade geral da API) + dependências atualizadas.
+
+### 🎙️ Áudio da chamada (integrações de voz/IA)
+
+- **Transporte de áudio da chamada por WebSocket** — PCM16 full-duplex direto (sem
+  Opus) com eventos opt-in (`?events=1`). Contrato estável para um agente de
+  voz/IA consumir o áudio da ligação em tempo real.
+
+### 🛠️ Infra & Diagnóstico
+
+- **Revisão de build embutida na imagem** (`org.opencontainers.image.revision`) —
+  identifica exatamente qual commit está rodando.
+- Logs de diagnóstico do SSE e do broadcast de chamada recebida; revalidação de
+  cache do `widget.js`.
+
 ## v0.0.6 — 2026-08-14
 
 Correção de sincronização de chamada entre dispositivos, conexão de sessão por

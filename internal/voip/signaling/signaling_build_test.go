@@ -55,3 +55,34 @@ func TestBuildTerminateElsewhereStanza(t *testing.T) {
 		t.Fatalf("segundo destination = %q, want %q", j, dev5)
 	}
 }
+
+// O reject precisa carregar count="0" (igual ao whatsmeow); sem ele o chamador
+// não registra a recusa e continua tocando.
+func TestBuildRejectStanzaHasCount(t *testing.T) {
+	peer := types.NewJID("62440234549366", types.HiddenUserServer)
+	creator := types.NewJID("62440234549366", types.HiddenUserServer)
+	own := types.NewJID("111222333", types.HiddenUserServer)
+	own.Device = 3 // deve ser normalizado (ToNonAD) no from
+
+	node := BuildRejectStanza(peer, "CID", creator, own)
+	if node.Tag != "call" {
+		t.Fatalf("wrapper tag = %q", node.Tag)
+	}
+	// o <call> precisa carregar from=ownID (ToNonAD) e to=callFrom
+	if f := wanode.AttrString(node.Attrs, "from"); f != own.ToNonAD().String() {
+		t.Fatalf("from = %q, want %q", f, own.ToNonAD())
+	}
+	if to := wanode.AttrString(node.Attrs, "to"); to != peer.String() {
+		t.Fatalf("to = %q, want %q", to, peer)
+	}
+	rej := findChild(&node, "reject")
+	if rej == nil {
+		t.Fatal("nó reject ausente")
+	}
+	if c := wanode.AttrString(rej.Attrs, "count"); c != "0" {
+		t.Fatalf("count = %q, want \"0\"", c)
+	}
+	if id := wanode.AttrString(rej.Attrs, "call-id"); id != "CID" {
+		t.Fatalf("call-id = %q", id)
+	}
+}

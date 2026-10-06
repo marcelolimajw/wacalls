@@ -6,10 +6,23 @@ import (
 	"strings"
 	"time"
 
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
+
+// messageIDFromRequest lê um id de mensagem fornecido pelo cliente para
+// IDEMPOTÊNCIA no envio: header X-Message-ID ou query ?id=. Reenviar com o mesmo
+// id não duplica a mensagem no WhatsApp (mesmo id = mesma mensagem). Vazio = o
+// whatsmeow gera um id aleatório (comportamento antigo). Pegue um id novo em
+// GET /api/sessions/{sid}/messages/new-message-id.
+func messageIDFromRequest(r *http.Request) string {
+	if id := strings.TrimSpace(r.Header.Get("X-Message-ID")); id != "" {
+		return id
+	}
+	return strings.TrimSpace(r.URL.Query().Get("id"))
+}
 
 // msgTarget resolve o par (chat, remetente) de uma mensagem existente a partir do
 // corpo da requisição. Para ações como reação, edição, exclusão e "visto", o
@@ -280,10 +293,58 @@ func (s *server) handleTyping(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// handleSendEvent cria/envia um EVENTO (EventMessage) do WhatsApp. Espelha o
+// padrão dos demais envios ricos. Se a conta/WhatsApp não suportar EventMessage,
+// o SendMessage retorna erro e ele é devolvido claro pela resposta.
+func (s *server) handleSendEvent(w http.ResponseWriter, r *http.Request) {
+	sess := s.pairedSession(w, r.PathValue("sid"))
+	if sess == nil {
+		return
+	}
+	var b struct {
+		To          string `json:"to"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		StartTime   int64  `json:"startTime"` // epoch (segundos) do início
+		EndTime     int64  `json:"endTime"`   // opcional
+		Location    string `json:"location"`  // opcional (nome/endereço)
+		JoinLink    string `json:"joinLink"`  // opcional (link da call)
+		IsCanceled  bool   `json:"isCanceled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&b); err != nil || strings.TrimSpace(b.Name) == "" || b.StartTime <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name and startTime (epoch seconds) required"})
+		return
+	}
+	ev := &waE2E.EventMessage{
+		Name:      proto.String(strings.TrimSpace(b.Name)),
+		StartTime: proto.Int64(b.StartTime),
+	}
+	if d := strings.TrimSpace(b.Description); d != "" {
+		ev.Description = proto.String(d)
+	}
+	if b.EndTime > 0 {
+		ev.EndTime = proto.Int64(b.EndTime)
+	}
+	if loc := strings.TrimSpace(b.Location); loc != "" {
+		ev.Location = &waE2E.LocationMessage{Name: proto.String(loc)}
+	}
+	if jl := strings.TrimSpace(b.JoinLink); jl != "" {
+		ev.JoinLink = proto.String(jl)
+	}
+	if b.IsCanceled {
+		ev.IsCanceled = proto.Bool(true)
+	}
+	s.send(sess, w, r, b.To, &waE2E.Message{EventMessage: ev})
+}
+
 // sendTo despacha uma mensagem já montada para um JID resolvido e devolve o
 // mesmo formato de resposta de send().
 func (s *server) sendTo(sess *Session, w http.ResponseWriter, r *http.Request, jid types.JID, msg *waE2E.Message) {
-	resp, err := sess.client.SendMessage(r.Context(), jid, msg)
+	var extra []whatsmeow.SendRequestExtra
+	if id := messageIDFromRequest(r); id != "" {
+		extra = append(extra, whatsmeow.SendRequestExtra{ID: types.MessageID(id)})
+	}
+	resp, err := sess.sendResolvingLID(r.Context(), jid, msg, extra...)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return

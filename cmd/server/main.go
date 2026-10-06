@@ -13,6 +13,15 @@ import (
 	"time"
 )
 
+// version é o CANAL do build (nome do branch/tag: "develop", "v1.0.2"...), injetado
+// via ldflags no Docker (-X main.version=$BUILD_VERSION). commit é o SHA do git
+// (-X main.commit=$BUILD_REV). "dev" em builds locais. Expostos em /api/config; o
+// painel mostra `version` ao lado da logo e o `commit` no tooltip.
+var (
+	version = "dev"
+	commit  = "dev"
+)
+
 // envInt lê um inteiro de uma variável de ambiente (com valor padrão).
 func envInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
@@ -73,6 +82,7 @@ func main() {
 	// Worker de reentrega ao Chatwoot: reenvia com backoff o que falhou (ex.:
 	// Chatwoot fora do ar) em vez de perder a mensagem.
 	go srv.sessions.runChatwootOutbox(ctx)
+	go srv.sessions.runScheduler(ctx)
 
 	httpSrv := &http.Server{Addr: *addr, Handler: srv.routes()}
 	go func() {
